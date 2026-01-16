@@ -22,7 +22,6 @@ public class HytaleAccountDataServiceClient {
                 .asObjectAsync(GetProfilesResponse.class)
                 .thenApply(res -> {
                     if (!res.isSuccess()) {
-                        System.out.println(res.getParsingError());
                         log.error("got non success from account data service while getting game profiles (status={})", res.getStatus());
                         return null;
                     }
