@@ -1,0 +1,22 @@
+bind = "0.0.0.0:5520"
+
+# where players will join back when we transfer them
+public-ip = "127.0.0.1:5520"
+
+# where the proxy secret is stored, this secret can be overridden with the HYPROXY_SECRET environment varaible
+proxy-secret-file = "proxy.secret"
+
+# if we should bind on ipv6 too, heavily recommended
+ipv6-support = true
+
+# initial backend or backend set we should in order try to connect the user to.
+initial-backend = "main"
+
+# the backends the proxy will send players to
+[backends]
+main = "127.0.0.1:5521"
+lobby-1 = "127.0.0.1:5522"
+lobby-2 = "127.0.0.1:5523"
+
+# profile id -> permissions array, "op" permission will give access to all permissions.
+[permissions]

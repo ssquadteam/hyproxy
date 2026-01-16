@@ -1,0 +1,15 @@
+{
+  "Group": "xyzeva",
+  "Name": "HyProxyBackend",
+  "Version": "1.0.0",
+  "Authors": [
+    {
+      "Name": "eva",
+      "Email": "xyzeva@riseup.net",
+      "Url": "https://kibty.town"
+    }
+  ],
+  "Website": "https://github.com/xyzeva/hyproxy",
+  "Main": "town.kibty.hyproxy.plugin.HyProxyBackendPlugin",
+  "ServerVersion": "*"
+}
