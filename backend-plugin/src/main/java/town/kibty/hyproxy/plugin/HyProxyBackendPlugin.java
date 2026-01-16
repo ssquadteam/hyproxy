@@ -21,6 +21,7 @@ import town.kibty.hyproxy.plugin.command.HyProxyBackendCommand;
 import town.kibty.hyproxy.plugin.config.HyProxyBackendConfig;
 
 import java.nio.charset.StandardCharsets;
+import java.util.logging.Level;
 
 public class HyProxyBackendPlugin extends JavaPlugin {
     private final Config<HyProxyBackendConfig> config = this.withConfig("config", HyProxyBackendConfig.CODEC);
