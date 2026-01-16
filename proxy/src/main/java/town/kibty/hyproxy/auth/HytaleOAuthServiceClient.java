@@ -180,6 +180,17 @@ public class HytaleOAuthServiceClient {
         try {
             OAuthSession session = GSON.fromJson(Files.readString(filePath, StandardCharsets.UTF_8), OAuthSession.class);
 
+            if (Instant.now().getEpochSecond() > session.accessTokenExpiresAt()) {
+                TokenResponse refreshedTokenResponse = this.refreshToken(session.refreshToken()).get(10L, TimeUnit.SECONDS);
+                if (refreshedTokenResponse == null) {
+                    log.error("failed to refresh token, ignoring oauth session");
+                    return false;
+                }
+
+                log.info("refreshed oauth session");
+                session = this.storeOAuthSession(filePath, refreshedTokenResponse, session.profileId());
+            }
+
             GameSessionResponse sessionResponse = this.proxy.getSessionServiceClient().createGameSession(session.accessToken(), session.profileId())
                     .get(10L, TimeUnit.SECONDS);
             proxy.getSessionServiceClient().setGameSession(sessionResponse);
@@ -259,6 +270,31 @@ public class HytaleOAuthServiceClient {
                 })
                 .exceptionally(ex -> {
                     log.error("error while exchanging device code", ex);
+                    return null;
+                });
+    }
+
+    public CompletableFuture<@Nullable TokenResponse> refreshToken(String refreshToken) {
+        Charset charset = StandardCharsets.UTF_8;
+        return Unirest.post(OAUTH_BASE_URL + "/oauth2/token")
+                .contentType("application/x-www-form-urlencoded")
+                .charset(charset)
+                .body(String.format(
+                        "grant_type=refresh_token&client_id=%s&refresh_token=%s",
+                        URLEncoder.encode(SERVER_CLIENT_ID, charset),
+                        URLEncoder.encode(refreshToken, charset)
+                ))
+                .asObjectAsync(TokenResponse.class)
+                .thenApply(res -> {
+                    if (!res.isSuccess()) {
+                        log.error("got non success from oauth service while refreshing token (status={})", res.getStatus());
+                        return null;
+                    }
+
+                    return res.getBody();
+                })
+                .exceptionally(ex -> {
+                    log.error("error while refreshing token", ex);
                     return null;
                 });
     }

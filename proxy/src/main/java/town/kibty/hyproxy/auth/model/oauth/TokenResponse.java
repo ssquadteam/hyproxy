@@ -13,6 +13,6 @@ public record TokenResponse(
         @SerializedName("error")
         @Nullable String error,
         @SerializedName("expires_in")
-        @Nullable Integer expiresIn
+        int expiresIn
 ) {
 }
