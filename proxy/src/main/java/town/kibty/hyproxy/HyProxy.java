@@ -87,7 +87,7 @@ public class HyProxy {
 
             QuicSslContext sslContext = QuicSslContextBuilder
                     .forServer(selfSignedCertificate.key(), null, selfSignedCertificate.cert())
-                    .applicationProtocols("hytale/1")
+                    .applicationProtocols("hytale/2")
                     .earlyData(false).clientAuth(ClientAuth.REQUIRE)
                     .trustManager(InsecureTrustManagerFactory.INSTANCE)
                     .build();

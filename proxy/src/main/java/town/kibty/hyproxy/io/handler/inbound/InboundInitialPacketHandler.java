@@ -27,7 +27,9 @@ public class InboundInitialPacketHandler implements HytalePacketHandler {
 
         HyProxyPlayer player = new HyProxyPlayer(connection.getProxy(), connection);
 
-        player.setProtocolHash(connect.getProtocolHash());
+        player.setProtocolCrc(connect.getProtocolCrc());
+        player.setProtocolBuildNumber(connect.getProtocolBuildNumber());
+        player.setClientVersion(connect.getClientVersion());
         player.setProfileId(connect.getUuid());
         player.setUsername(connect.getUsername());
         player.setIdentityToken(connect.getIdentityToken());

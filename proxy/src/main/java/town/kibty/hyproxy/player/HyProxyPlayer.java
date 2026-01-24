@@ -35,7 +35,11 @@ public class HyProxyPlayer implements CommandSender {
 
     // player info
     @Setter
-    private String protocolHash;
+    private int protocolCrc;
+    @Setter
+    private int protocolBuildNumber;
+    @Setter
+    private String clientVersion;
     @Setter
     private UUID profileId;
     @Setter

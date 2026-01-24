@@ -20,7 +20,9 @@ import java.util.UUID;
 @RequiredArgsConstructor
 @ToString
 public class Connect implements Packet {
-    private final String protocolHash;
+    private final int protocolCrc;
+    private final int protocolBuildNumber;
+    private final String clientVersion;
     private final ClientType clientType;
     private final UUID uuid;
     private final @Nullable String language;
@@ -37,47 +39,51 @@ public class Connect implements Packet {
     public static Connect deserialize(ByteBuf buf) {
         byte nullBits = buf.readByte();
 
-        byte[] protocolHashBytes = new byte[64];
-        buf.readBytes(protocolHashBytes);
-        String protocolHash = new String(protocolHashBytes);
+        int protocolCrc = buf.readIntLE();
+        int protocolBuildNumber = buf.readIntLE();
+
+        byte[] clientVersionBytes = new byte[20];
+        buf.readBytes(clientVersionBytes);
+        String clientVersion = new String(clientVersionBytes, StandardCharsets.US_ASCII);
 
         ClientType clientType = ClientType.getById(buf.readByte());
         UUID uuid = ProtocolUtil.readUUID(buf);
 
-        int languageOffset = buf.readIntLE();
-        int identityTokenOffset = buf.readIntLE();
         int usernameOffset = buf.readIntLE();
+        int identityTokenOffset = buf.readIntLE();
+        int languageOffset = buf.readIntLE();
         int referralDataOffset = buf.readIntLE();
         int referralSourceOffset = buf.readIntLE();
         int varsOffset = buf.readerIndex();
 
         int readViaOffsets = 0;
-        String language = null;
-        if ((nullBits & 0x1) != 0) {
-            int offset = varsOffset + languageOffset;
-            Pair<String, Integer> varString = ProtocolUtil.readVarString(buf, offset, 128);
-            language = varString.left();
-            readViaOffsets += varString.right();
-        }
-
-        String identityToken = null;
-
-        if ((nullBits & 0x2) != 0) {
-            int offset = varsOffset + identityTokenOffset;
-            Pair<String, Integer> varString = ProtocolUtil.readVarString(buf, offset, 8192);
-            identityToken = varString.left();
-            readViaOffsets += varString.right();
-        }
 
         int absoluteUsernameOffset = varsOffset + usernameOffset;
         Pair<String, Integer> varString = ProtocolUtil.readVarString(buf, absoluteUsernameOffset, 16);
         String username = varString.left();
         readViaOffsets += varString.right();
 
+        String identityToken = null;
+
+        if ((nullBits & 0x1) != 0) {
+            int offset = varsOffset + identityTokenOffset;
+            varString = ProtocolUtil.readVarString(buf, offset, 8192);
+            identityToken = varString.left();
+            readViaOffsets += varString.right();
+        }
+
+        String language = null;
+
+        int offset = varsOffset + languageOffset;
+        varString = ProtocolUtil.readVarString(buf, offset, 128);
+        language = varString.left();
+        readViaOffsets += varString.right();
+
+
         byte[] referralData = null;
 
-        if ((nullBits & 0x4) != 0) {
-            int offset = varsOffset + referralDataOffset;
+        if ((nullBits & 0x2) != 0) {
+            offset = varsOffset + referralDataOffset;
 
             int varIntLength = VarIntUtil.length(buf, offset);
             int length = VarIntUtil.peek(buf, offset);
@@ -94,8 +100,8 @@ public class Connect implements Packet {
 
         HostAddress referralSource = null;
 
-        if ((nullBits & 0x8) != 0) {
-            int offset = varsOffset + referralSourceOffset;
+        if ((nullBits & 0x4) != 0) {
+            offset = varsOffset + referralSourceOffset;
 
             Pair<HostAddress, Integer> hostAddressPair = HostAddress.deserialize(buf, offset);
             referralSource = hostAddressPair.left();
@@ -104,34 +110,37 @@ public class Connect implements Packet {
 
 
         buf.readerIndex(varsOffset + readViaOffsets);
-        return new Connect(protocolHash, clientType, uuid, language, identityToken, username, referralData, referralSource);
+        return new Connect(protocolCrc, protocolBuildNumber, clientVersion, clientType, uuid, language, identityToken, username, referralData, referralSource);
     }
 
     @Override
     public void serialize(ByteBuf buf) {
         byte nullBits = 0;
-        if (this.language != null)
+
+        if (this.identityToken != null) {
             nullBits = (byte) (nullBits | 0x1);
+        }
 
-        if (this.identityToken != null)
+        if (this.referralData != null) {
             nullBits = (byte) (nullBits | 0x2);
+        }
 
-        if (this.referralData != null)
+        if (this.referralSource != null) {
             nullBits = (byte) (nullBits | 0x4);
-
-        if (this.referralSource != null)
-            nullBits = (byte) (nullBits | 0x8);
+        }
 
         buf.writeByte(nullBits);
-        buf.writeBytes(this.protocolHash.getBytes(StandardCharsets.UTF_8));
+        buf.writeIntLE(this.protocolCrc);
+        buf.writeIntLE(this.protocolBuildNumber);
+        buf.writeBytes(this.clientVersion.getBytes(StandardCharsets.UTF_8));
         buf.writeByte(this.clientType.getId());
         ProtocolUtil.writeUUID(buf, this.uuid);
 
-        int languageOffsetSlot = buf.writerIndex();
+        int usernameOffsetSlot = buf.writerIndex();
         buf.writeIntLE(-1);
         int identityTokenOffsetSlot = buf.writerIndex();
         buf.writeIntLE(-1);
-        int usernameOffsetSlot = buf.writerIndex();
+        int languageOffsetSlot = buf.writerIndex();
         buf.writeIntLE(-1);
         int referralDataOffsetSlot = buf.writerIndex();
         buf.writeIntLE(-1);
@@ -139,18 +148,17 @@ public class Connect implements Packet {
         buf.writeIntLE(-1);
 
         int varsOffset = buf.writerIndex();
-        if (this.language != null) {
-            buf.setIntLE(languageOffsetSlot, buf.writerIndex() - varsOffset);
-            ProtocolUtil.writeVarString(buf, this.language);
-        }
+
+        buf.setIntLE(usernameOffsetSlot, buf.writerIndex() - varsOffset);
+        ProtocolUtil.writeVarString(buf, this.username);
 
         if (this.identityToken != null) {
             buf.setIntLE(identityTokenOffsetSlot, buf.writerIndex() - varsOffset);
             ProtocolUtil.writeVarString(buf, this.identityToken);
         }
 
-        buf.setIntLE(usernameOffsetSlot, buf.writerIndex() - varsOffset);
-        ProtocolUtil.writeVarString(buf, this.username);
+        buf.setIntLE(languageOffsetSlot, buf.writerIndex() - varsOffset);
+        ProtocolUtil.writeVarString(buf, this.language);
 
         if (this.referralData != null) {
             buf.setIntLE(referralDataOffsetSlot, buf.writerIndex() - varsOffset);

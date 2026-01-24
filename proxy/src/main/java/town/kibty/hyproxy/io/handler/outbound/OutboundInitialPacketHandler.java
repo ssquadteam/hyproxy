@@ -26,7 +26,9 @@ public class OutboundInitialPacketHandler implements HytalePacketHandler {
         HyProxyConfiguration config = player.getProxy().getConfiguration();
 
         connection.send(new Connect(
-                player.getProtocolHash(),
+                player.getProtocolCrc(),
+                player.getProtocolBuildNumber(),
+                player.getClientVersion(),
                 player.getClientType(),
                 player.getProfileId(),
                 player.getLanguage(),

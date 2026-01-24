@@ -69,7 +69,7 @@ public class QuicChannelInboundHandlerAdapter extends ChannelInboundHandlerAdapt
 
                         Channel channel = ctx.channel();
                         if (channel.isWritable()) {
-                            channel.writeAndFlush(new Disconnect("Interanl proxy error!", DisconnectType.CRASH)).addListener(ProtocolUtil.CLOSE_ON_COMPLETE);
+                            channel.writeAndFlush(new Disconnect("Internal proxy error!", DisconnectType.CRASH)).addListener(ProtocolUtil.CLOSE_ON_COMPLETE);
                             return;
                         }
 
