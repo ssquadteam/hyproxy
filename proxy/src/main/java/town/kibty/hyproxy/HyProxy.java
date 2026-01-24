@@ -36,6 +36,7 @@ import town.kibty.hyproxy.io.QuicChannelInboundHandlerAdapter;
 import town.kibty.hyproxy.player.HyProxyPlayer;
 import town.kibty.hyproxy.player.permission.OperatorsPlayerPermissionProvider;
 import town.kibty.hyproxy.player.permission.PlayerPermissionProvider;
+import town.kibty.hyproxy.plugin.HyProxyPluginManager;
 import town.kibty.hyproxy.util.AddressUtil;
 import town.kibty.hyproxy.util.CertificateUtil;
 import town.kibty.hyproxy.util.NettyUtil;
@@ -77,6 +78,8 @@ public class HyProxy {
 
     @Getter
     private final HyProxyCommandManager commandManager = new HyProxyCommandManager(this);
+
+    private final HyProxyPluginManager pluginManager = new HyProxyPluginManager(this);
 
     private final List<PlayerPermissionProvider> playerPermissionProviders = new ArrayList<>();
 
@@ -134,6 +137,13 @@ public class HyProxy {
             this.registerInitialConfigBackends();
             this.registerProvidedCommands();
             this.addPlayerPermissionProvider(new OperatorsPlayerPermissionProvider());
+
+            Path pluginsDir = Path.of("plugins");
+            if (!pluginsDir.toFile().isDirectory()) {
+                pluginsDir.toFile().mkdirs();
+            }
+
+            this.pluginManager.loadPlugins(pluginsDir);
 
             this.oAuthServiceClient.start();
             this.sessionServiceClient.start();
