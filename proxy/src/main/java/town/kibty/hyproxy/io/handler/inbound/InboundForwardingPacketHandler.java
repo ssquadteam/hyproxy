@@ -17,6 +17,7 @@ import town.kibty.hyproxy.io.channel.OutboundChannelInitializer;
 import town.kibty.hyproxy.io.packet.Packet;
 import town.kibty.hyproxy.io.packet.impl.Disconnect;
 import town.kibty.hyproxy.io.packet.impl.game.ChatMessage;
+import town.kibty.hyproxy.io.packet.impl.setup.ServerInfo;
 import town.kibty.hyproxy.player.HyProxyPlayer;
 
 import java.util.Locale;
@@ -28,7 +29,7 @@ public class InboundForwardingPacketHandler implements HytalePacketHandler {
 
     @Override
     public void activated() {
-        HyProxyPlayer player = connection.getPlayer();
+        HyProxyPlayer player = connection.ensurePlayer();
         HyProxyBackend backend = player.getReferredBackend() != null ? player.getReferredBackend() : connection.getProxy().getInitialBackend();
 
         new Bootstrap()
@@ -48,7 +49,7 @@ public class InboundForwardingPacketHandler implements HytalePacketHandler {
             return false;
         }
 
-        return connection.getPlayer().performCommand(message.substring(1));
+        return connection.ensurePlayer().performCommand(message.substring(1));
     }
 
     @Override
@@ -59,7 +60,7 @@ public class InboundForwardingPacketHandler implements HytalePacketHandler {
 
     @Override
     public void handleGeneric(Packet packet) {
-        HyProxyPlayer player = connection.getPlayer();
+        HyProxyPlayer player = connection.ensurePlayer();
 
         if (!player.hasActiveOutboundConnection()) return;
         player.sendAsPlayer(packet);
@@ -67,7 +68,7 @@ public class InboundForwardingPacketHandler implements HytalePacketHandler {
 
     @Override
     public void handleUnknown(ByteBuf buf) {
-        HyProxyPlayer player = connection.getPlayer();
+        HyProxyPlayer player = connection.ensurePlayer();
 
         if (!player.hasActiveOutboundConnection()) return;
         player.getOutboundConnection().getChannel().writeAndFlush(buf.retain());
@@ -75,7 +76,7 @@ public class InboundForwardingPacketHandler implements HytalePacketHandler {
 
     @Override
     public void disconnected() {
-        HyProxyPlayer player = connection.getPlayer();
+        HyProxyPlayer player = connection.ensurePlayer();
 
         if (!player.hasActiveOutboundConnection()) return;
         player.getOutboundConnection().getChannel().disconnect();

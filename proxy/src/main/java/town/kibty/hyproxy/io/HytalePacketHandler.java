@@ -7,6 +7,7 @@ import town.kibty.hyproxy.io.packet.impl.Disconnect;
 import town.kibty.hyproxy.io.packet.impl.auth.*;
 import town.kibty.hyproxy.io.packet.impl.game.ChatMessage;
 import town.kibty.hyproxy.io.packet.impl.game.ServerMessage;
+import town.kibty.hyproxy.io.packet.impl.setup.ServerInfo;
 
 public interface HytalePacketHandler {
     default void connected() {}
@@ -39,6 +40,9 @@ public interface HytalePacketHandler {
         return false;
     }
     default boolean handle(ChatMessage chatMessage) {
+        return false;
+    }
+    default boolean handle(ServerInfo serverInfo) {
         return false;
     }
 

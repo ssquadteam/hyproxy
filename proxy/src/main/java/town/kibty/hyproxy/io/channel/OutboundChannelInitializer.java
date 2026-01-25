@@ -27,7 +27,7 @@ public class OutboundChannelInitializer extends ChannelInitializer<Channel> {
 
         HytaleConnection outboundConnection = new HytaleConnection(channel, proxy);
         outboundConnection.setPlayer(inboundConnection.getPlayer());
-        outboundConnection.getPlayer().setOutboundConnection(outboundConnection);
+        outboundConnection.ensurePlayer().setOutboundConnection(outboundConnection);
 
         outboundConnection.setPacketHandler(new OutboundInitialPacketHandler(outboundConnection, backend));
         channel.pipeline().addLast("handler", outboundConnection);

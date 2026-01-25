@@ -64,7 +64,7 @@ public class HytaleConnection extends ChannelInboundHandlerAdapter {
         }
 
         // only fire onDisconnect once
-        if (this.hasPlayer() && this.getPlayer().getInboundConnection() == this) {
+        if (this.hasPlayer() && this.ensurePlayer().getInboundConnection() == this) {
             this.player.onDisconnect();
         }
     }
@@ -99,6 +99,13 @@ public class HytaleConnection extends ChannelInboundHandlerAdapter {
         this.packetHandler.activated();
     }
 
+    public HyProxyPlayer ensurePlayer() {
+        if (this.player == null) {
+            throw new IllegalStateException("tried to ensure player but player was null");
+        }
+
+        return this.player;
+    }
     public boolean hasPlayer() {
         return this.player != null;
     }

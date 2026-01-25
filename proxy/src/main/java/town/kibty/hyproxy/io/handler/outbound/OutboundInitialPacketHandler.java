@@ -22,7 +22,7 @@ public class OutboundInitialPacketHandler implements HytalePacketHandler {
 
     @Override
     public void connected() {
-        HyProxyPlayer player = connection.getPlayer();
+        HyProxyPlayer player = connection.ensurePlayer();
         HyProxyConfiguration config = player.getProxy().getConfiguration();
 
         connection.send(new Connect(
@@ -54,7 +54,7 @@ public class OutboundInitialPacketHandler implements HytalePacketHandler {
 
     @Override
     public void disconnected() {
-        HyProxyPlayer player = connection.getPlayer();
+        HyProxyPlayer player = connection.ensurePlayer();
 
         if (!player.hasActiveInboundConnection()) return;
         player.getInboundConnection().close();

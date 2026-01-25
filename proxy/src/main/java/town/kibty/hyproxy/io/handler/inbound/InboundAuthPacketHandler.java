@@ -23,7 +23,7 @@ public class InboundAuthPacketHandler implements HytalePacketHandler {
 
     @Override
     public void activated() {
-        HyProxyPlayer player = connection.getPlayer();
+        HyProxyPlayer player = connection.ensurePlayer();
         if (player.getIdentityToken() == null) {
             connection.disconnect("This proxy only supports online mode players!");
             return;
@@ -69,7 +69,7 @@ public class InboundAuthPacketHandler implements HytalePacketHandler {
 
     @Override
     public boolean handle(AuthToken authToken) {
-        HyProxyPlayer player = connection.getPlayer();
+        HyProxyPlayer player = connection.ensurePlayer();
 
         if (this.authState != AuthState.AWAITING_AUTH_TOKEN) {
             connection.disconnect("Protocol error: unexpected AuthToken packet");
@@ -130,7 +130,7 @@ public class InboundAuthPacketHandler implements HytalePacketHandler {
                                 }
 
                                 // check again as another connection may have come through
-                                if (connection.getProxy().getPlayerByProfileId(connection.getPlayer().getProfileId()) != null) {
+                                if (connection.getProxy().getPlayerByProfileId(connection.ensurePlayer().getProfileId()) != null) {
                                     connection.disconnect("You are already connected to this proxy!");
                                     return;
                                 }

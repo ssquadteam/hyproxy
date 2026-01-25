@@ -6,6 +6,7 @@ import town.kibty.hyproxy.io.packet.impl.Disconnect;
 import town.kibty.hyproxy.io.packet.impl.auth.*;
 import town.kibty.hyproxy.io.packet.impl.game.ChatMessage;
 import town.kibty.hyproxy.io.packet.impl.game.ServerMessage;
+import town.kibty.hyproxy.io.packet.impl.setup.ServerInfo;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -26,6 +27,7 @@ public class PacketRegistry {
         register(new PacketInfo(18, ClientReferral.class, ClientReferral::deserialize));
         register(new PacketInfo(210, ServerMessage.class, ServerMessage::deserialize));
         register(new PacketInfo(211, ChatMessage.class, ChatMessage::deserialize));
+        register(new PacketInfo(223, ServerInfo.class, ServerInfo::deserialize));
     }
 
     public static PacketInfo getPacketById(int id) {
