@@ -32,7 +32,9 @@ import town.kibty.hyproxy.command.provided.SendCommand;
 import town.kibty.hyproxy.command.provided.ShutdownCommand;
 import town.kibty.hyproxy.config.HyProxyConfiguration;
 import town.kibty.hyproxy.console.HyProxyConsole;
+import town.kibty.hyproxy.event.HyProxyEventBus;
 import town.kibty.hyproxy.io.QuicChannelInboundHandlerAdapter;
+import town.kibty.hyproxy.io.proto.NetworkChannel;
 import town.kibty.hyproxy.player.HyProxyPlayer;
 import town.kibty.hyproxy.player.permission.OperatorsPlayerPermissionProvider;
 import town.kibty.hyproxy.player.permission.PlayerPermissionProvider;
@@ -49,6 +51,7 @@ import java.util.concurrent.ConcurrentHashMap;
 @Log4j2
 public class HyProxy {
     public static final AttributeKey<X509Certificate> CLIENT_CERTIFICATE_ATTR = AttributeKey.valueOf("CLIENT_CERTIFICATE");
+    public static final AttributeKey<NetworkChannel> STREAM_CHANNEL_KEY = AttributeKey.newInstance("STREAM_CHANNEL_ID");
     private static final EventLoopGroup WORKER_GROUP = NettyUtil.getEventLoopGroup("hyproxy-worker-group");
 
     private Bootstrap bootstrapIpv4 = null;
@@ -80,6 +83,9 @@ public class HyProxy {
     private final HyProxyCommandManager commandManager = new HyProxyCommandManager(this);
 
     private final HyProxyPluginManager pluginManager = new HyProxyPluginManager(this);
+
+    @Getter
+    private final HyProxyEventBus eventBus = new HyProxyEventBus();
 
     private final List<PlayerPermissionProvider> playerPermissionProviders = new ArrayList<>();
 
@@ -139,11 +145,18 @@ public class HyProxy {
             this.addPlayerPermissionProvider(new OperatorsPlayerPermissionProvider());
 
             Path pluginsDir = Path.of("plugins");
+            boolean shouldLoadPlugins = true;
+
             if (!pluginsDir.toFile().isDirectory()) {
-                pluginsDir.toFile().mkdirs();
+                if (!pluginsDir.toFile().mkdirs()) {
+                    shouldLoadPlugins = false;
+                    log.warn("failed to create plugins directory, plugins will NOT be loaded.");
+                }
             }
 
-            this.pluginManager.loadPlugins(pluginsDir);
+            if (shouldLoadPlugins) {
+                this.pluginManager.loadPlugins(pluginsDir);
+            }
 
             this.oAuthServiceClient.start();
             this.sessionServiceClient.start();
@@ -177,6 +190,10 @@ public class HyProxy {
         commandManager.registerCloudAnnotationCommand(new ShutdownCommand());
     }
 
+    /**
+     * reloads the proxy configuration
+     * @return if the reload was successful or not
+     */
     public boolean reloadConfig() {
         try {
             HyProxyConfiguration newConfig = HyProxyConfiguration.load(this, Path.of("config.toml"));
@@ -208,7 +225,7 @@ public class HyProxy {
                     continue;
                 }
 
-                log.warn("existing backend {} will not be updated via config reload, please restart if you wan't to change the address of an existing server", existingBackend.getInfo().id());
+                log.warn("existing backend {} will not be updated via config reload, please restart if you want to change the address of an existing server", existingBackend.getInfo().id());
             }
 
             this.configuration = newConfig;
@@ -220,6 +237,9 @@ public class HyProxy {
         }
     }
 
+    /**
+     * @return the initial backend as defined in the proxy configuration
+     */
     public @NonNull HyProxyBackend getInitialBackend() {
         return backendsById.get(configuration.getInitialBackend().toLowerCase(Locale.ROOT));
     }
@@ -228,6 +248,11 @@ public class HyProxy {
         return backendsById.get(id.toLowerCase(Locale.ROOT));
     }
 
+    /**
+     * registers a backend to be used by the proxy
+     * @param info the backend info
+     * @throws IllegalArgumentException if a backend with the same id is registered already
+     */
     public void registerBackend(BackendInfo info) {
         if (this.getBackendById(info.id()) != null) {
             throw new IllegalArgumentException("backend id " + info.id() + " is already registered");
@@ -236,9 +261,19 @@ public class HyProxy {
         this.backendsById.put(info.id().toLowerCase(Locale.ROOT), new HyProxyBackend(info));
     }
 
+    /**
+     * unregisters a backend so it is no longer used by the proxy.
+     * please transfer the players connected to this backend before calling this, or they will be disconnected.
+     * @param backend the backend to unregister
+     * @throws IllegalArgumentException if the backend is not registered
+     */
     public void unregisterBackend(HyProxyBackend backend) {
         if (this.getBackendById(backend.getInfo().id()) == null) {
             throw new IllegalArgumentException("backend id " + backend.getInfo().id() + " is not registered");
+        }
+
+        for (HyProxyPlayer player : backend.getPlayersConnected()) {
+            player.disconnect("proxy backend unregistered");
         }
 
         this.backendsById.remove(backend.getInfo().id().toLowerCase(Locale.ROOT));
@@ -256,6 +291,17 @@ public class HyProxy {
         log.info("registered {} config backends", i);
     }
 
+    /**
+     * gracefully shuts down the proxy
+     */
+    public void shutdown() {
+        this.shutdown(false);
+    }
+
+    /**
+     * gracefully shuts down the proxy
+     * @param error if the shutdown was because of an error. please log the error before calling this function
+     */
     public void shutdown(boolean error) {
         log.info("hyproxy is shutting down");
 
@@ -271,29 +317,45 @@ public class HyProxy {
         System.exit(error ? 1 : 0);
     }
 
-
+    /**
+     * adds a {@link PlayerPermissionProvider} to the list of permission providers
+     * @param provider the provider to add
+     */
     public void addPlayerPermissionProvider(PlayerPermissionProvider provider) {
         this.playerPermissionProviders.add(provider);
         provider.initialize(this);
         // re-sort
         this.playerPermissionProviders.sort(Comparator.comparingInt(PlayerPermissionProvider::priority).reversed());
-
     }
 
-    public void removePlayerPermissionProvider(PlayerPermissionProvider provider) {
-        this.playerPermissionProviders.add(provider);
+    /**
+     * removes a {@link PlayerPermissionProvider} to the list of permission providers
+     * @param provider the provider to remove
+     * @return if the provider was successfully removed or not
+     */
+    public boolean removePlayerPermissionProvider(PlayerPermissionProvider provider) {
+        boolean removed = this.playerPermissionProviders.remove(provider);
         // re-sort
         this.playerPermissionProviders.sort(Comparator.comparingInt(PlayerPermissionProvider::priority).reversed());
+
+        return removed;
     }
 
     public List<PlayerPermissionProvider> getPlayerPermissionProviders() {
         return ImmutableList.copyOf(this.playerPermissionProviders);
     }
 
+    /**
+     * @return all the authenticated players on the proxy
+     */
     public List<HyProxyPlayer> getPlayers() {
         return this.getPlayers(false);
     }
 
+    /**
+     * @param includeNonAuthenticated if we should include non-authenticated players or not
+     * @return all the players on the proxy
+     */
     public List<HyProxyPlayer> getPlayers(boolean includeNonAuthenticated) {
         Collection<HyProxyPlayer> allPlayers = this.playersByProfileId.values();
         if (includeNonAuthenticated) return ImmutableList.copyOf(allPlayers);
@@ -307,10 +369,21 @@ public class HyProxy {
         return ImmutableList.copyOf(activePlayers);
     }
 
+    /**
+     * gets an authenticated online player by hytale game profile id
+     * @param profileId the game profile id
+     * @return the player if authenticated and online. if not, null
+     */
     public @Nullable HyProxyPlayer getPlayerByProfileId(UUID profileId) {
         return this.getPlayerByProfileId(profileId, false);
     }
 
+    /**
+     * gets an online player by hytale game profile id
+     * @param profileId the game profile id
+     * @param includeNonAuthenticated if we should allow a non-authenticated player or not
+     * @return the player if online. if not, null
+     */
     public @Nullable HyProxyPlayer getPlayerByProfileId(UUID profileId, boolean includeNonAuthenticated) {
         HyProxyPlayer player = this.playersByProfileId.get(profileId);
         if (player == null) {
@@ -323,10 +396,21 @@ public class HyProxy {
         return null;
      }
 
+    /**
+     * gets an authenticated online player by hytale game profile username
+     * @param username the game profile username
+     * @return the player if authenticated and online. if not, null
+     */
     public @Nullable HyProxyPlayer getPlayerByUsername(String username) {
         return this.getPlayerByUsername(username, false);
     }
 
+    /**
+     * gets an online player by hytale game profile username
+     * @param username the game profile username
+     * @param includeNonAuthenticated if we should allow a non-authenticated player or not
+     * @return the player if online. if not, null
+     */
     public @Nullable HyProxyPlayer getPlayerByUsername(String username, boolean includeNonAuthenticated) {
         HyProxyPlayer player = this.playersByUsername.get(username.toLowerCase(Locale.ROOT));
         if (player == null) {
@@ -339,7 +423,9 @@ public class HyProxy {
         return null;
     }
 
-
+    /**
+     * internal: please don't call this!
+     */
     public void registerPlayer(HyProxyPlayer player) {
         if (this.getPlayerByProfileId(player.getProfileId(), true) != null) {
             throw new IllegalArgumentException("player profile id " + player.getProfileId() + " already registered");
@@ -348,6 +434,9 @@ public class HyProxy {
         this.playersByUsername.put(player.getUsername().toLowerCase(Locale.ROOT), player);
     }
 
+    /**
+     * internal: please don't call this!
+     */
     public void unregisterPlayer(HyProxyPlayer player) {
         if (this.getPlayerByProfileId(player.getProfileId(), true) == null) {
             throw new IllegalArgumentException("player profile id " + player.getProfileId() + " not registered");
@@ -359,9 +448,4 @@ public class HyProxy {
     public String getServerCertFingerprint() {
         return CertificateUtil.computeCertificateFingerprint(this.serverCert);
     }
-
-    public void shutdown() {
-        this.shutdown(false);
-    }
-
 }

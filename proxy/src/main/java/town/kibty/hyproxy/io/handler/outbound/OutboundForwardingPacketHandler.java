@@ -5,7 +5,9 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import town.kibty.hyproxy.HyProxy;
 import town.kibty.hyproxy.backend.HyProxyBackend;
+import town.kibty.hyproxy.common.communication.ProxyCommunicationMessage;
 import town.kibty.hyproxy.common.util.ProxyCommunicationUtil;
+import town.kibty.hyproxy.event.impl.proxy.ProxyCommunicationMessageEvent;
 import town.kibty.hyproxy.io.HytaleConnection;
 import town.kibty.hyproxy.io.HytalePacketHandler;
 import town.kibty.hyproxy.io.packet.Packet;
@@ -39,21 +41,27 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
         HyProxyPlayer player = connection.ensurePlayer();
 
         if (!player.hasActiveInboundConnection()) return;
-        player.getInboundConnection().getChannel().writeAndFlush(buf.retain());
+        player.getInboundConnection().write(buf);
     }
 
+    // this should never happen in normal conditions, but we make it happen in the backend plugin to have a way for the backend
+    // to communicate with the proxy.
+    // the backend sends a AuthGrant packet in play/setup state, with the server identity token set to hyProxy.<base64_payload>
+    // which we then decode into our own, or fire an event for plugins to listen to for unknown ones
     @Override
     public boolean handle(AuthGrant passwordResponse) {
+        HyProxy proxy = connection.getProxy();
+
+        if (!proxy.getConfiguration().isProxyCommunicationEnabled()) return false;
         if (passwordResponse.getServerIdentityToken() == null) return false;
 
-        ProxyCommunicationUtil.ProxyCommunicationMessage message = ProxyCommunicationUtil.deserializeMessage(passwordResponse.getServerIdentityToken());
+        ProxyCommunicationMessage message = ProxyCommunicationUtil.deserializeMessage(passwordResponse.getServerIdentityToken());
 
         if (message == null) return false;
 
-        HyProxy proxy = connection.getProxy();
         // todo: move this somewhere else
         switch (message) {
-            case ProxyCommunicationUtil.ProxyCommunicationMessage.SendToBackend sendToBackend -> {
+            case ProxyCommunicationMessage.SendToBackend sendToBackend -> {
                 HyProxyPlayer target = proxy.getPlayerByProfileId(sendToBackend.targetId());
                 HyProxyPlayer sender = proxy.getPlayerByProfileId(sendToBackend.senderId());
 
@@ -84,7 +92,19 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
                     );
                 }
             }
-            case ProxyCommunicationUtil.ProxyCommunicationMessage.Unknown _ -> log.warn("backend sent unknown proxy communication message, ignoring");
+            case ProxyCommunicationMessage.Unknown msg -> {
+                ProxyCommunicationMessageEvent event = proxy.getEventBus().fire(new ProxyCommunicationMessageEvent(
+                        msg,
+                        false
+                ));
+
+                if (event.isHandled()) {
+                    return true;
+                }
+
+                log.warn("backend sent unknown proxy communication message but no plugin handled it");
+                return false;
+            }
         }
 
         return true;

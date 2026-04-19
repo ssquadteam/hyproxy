@@ -14,6 +14,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import org.jspecify.annotations.NonNull;
+import town.kibty.hyproxy.common.communication.ProxyCommunicationMessage;
 import town.kibty.hyproxy.common.util.ProxyCommunicationUtil;
 import town.kibty.hyproxy.common.util.RandomUtil;
 import town.kibty.hyproxy.common.util.SecretMessageUtil;
@@ -92,14 +93,14 @@ public class HyProxyBackendPlugin extends JavaPlugin {
         return proxySecret;
     }
 
-    public void sendProxyMessage(ProxyCommunicationUtil.ProxyCommunicationMessage message) {
+    public void sendProxyMessage(ProxyCommunicationMessage message) {
         this.sendProxyMessage(Universe.get().getPlayers().getFirst(), message);
     }
-    public void sendProxyMessage(PlayerRef playerRef, ProxyCommunicationUtil.ProxyCommunicationMessage message) {
+    public void sendProxyMessage(PlayerRef playerRef, ProxyCommunicationMessage message) {
         this.sendProxyMessage(playerRef.getPacketHandler().getChannel(), message);
     }
 
-    public void sendProxyMessage(Channel channel, ProxyCommunicationUtil.ProxyCommunicationMessage message) {
+    public void sendProxyMessage(Channel channel, ProxyCommunicationMessage message) {
         channel.writeAndFlush(new AuthGrant(
                 null,
                 ProxyCommunicationUtil.serializeMessage(message)

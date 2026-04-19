@@ -1,6 +1,7 @@
 package town.kibty.hyproxy.player;
 
 import com.google.common.collect.ImmutableSet;
+import io.netty.handler.codec.quic.QuicStreamChannel;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.Setter;
@@ -10,19 +11,24 @@ import town.kibty.hyproxy.HyProxy;
 import town.kibty.hyproxy.backend.HyProxyBackend;
 import town.kibty.hyproxy.command.CommandSender;
 import town.kibty.hyproxy.common.util.SecretMessageUtil;
+import town.kibty.hyproxy.event.impl.player.PlayerSentToBackendEvent;
 import town.kibty.hyproxy.io.HytaleConnection;
+import town.kibty.hyproxy.io.handler.outbound.OutboundEmptyPacketHandler;
 import town.kibty.hyproxy.io.packet.Packet;
 import town.kibty.hyproxy.io.packet.impl.ClientReferral;
 import town.kibty.hyproxy.io.packet.impl.game.ServerMessage;
 import town.kibty.hyproxy.io.proto.ClientType;
 import town.kibty.hyproxy.io.proto.DisconnectType;
+import town.kibty.hyproxy.io.proto.NetworkChannel;
 import town.kibty.hyproxy.message.Message;
 import town.kibty.hyproxy.player.permission.PlayerPermissionProvider;
 
 import java.time.Instant;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @Getter
@@ -57,33 +63,50 @@ public class HyProxyPlayer implements CommandSender {
     private boolean authenticated = false;
 
     private @Nullable HyProxyBackend connectedBackend;
+    private final Map<NetworkChannel, QuicStreamChannel> quicChannels = new ConcurrentHashMap<>();
 
-    public Set<String> getPermissions() {
-        Set<String> allPermissions = new HashSet<>();
-        for (PlayerPermissionProvider provider : proxy.getPlayerPermissionProviders()) {
-            allPermissions.addAll(provider.getPlayerPermissions(this));
+    /**
+     * sends a player to another backend. this will send the client a referral with special referral data
+     * that makes the proxy refer them to a different backend.
+     * fires {@link PlayerSentToBackendEvent}
+     * @param backend the new backend
+     */
+    public void sendPlayerToBackend(HyProxyBackend backend) {
+        PlayerSentToBackendEvent event = this.proxy.getEventBus().fire(new PlayerSentToBackendEvent(
+                this,
+                this.connectedBackend,
+                backend,
+                false
+        ));
+
+        if (event.isCanceled()) {
+            return;
         }
 
-        return ImmutableSet.copyOf(allPermissions);
-    }
-
-    public void sendPlayerToBackend(HyProxyBackend backend) {
-        log.info("{} is connecting to backend {}", this.getIdentifier(), backend.getInfo().id());
+        HyProxyBackend newBackend = event.getNewBackend();
+        log.info("{} is connecting to backend {}", this.getIdentifier(), newBackend.getInfo().id());
 
         byte[] referralData = SecretMessageUtil.generateReferralData(new SecretMessageUtil.BackendReferralMessage(
                 this.profileId,
-                backend.getInfo().id(),
+                newBackend.getInfo().id(),
                 Instant.now().getEpochSecond()
         ), proxy.getConfiguration().getProxySecret());
 
+        this.outboundConnection.setPacketHandler(new OutboundEmptyPacketHandler());
 
         this.sendToPlayer(new ClientReferral(proxy.getConfiguration().getPublicIp(), referralData));
+
+        this.outboundConnection.disconnect("player sent to another backend");
     }
 
     public String getIdentifier() {
         return String.format("%s (%s)", this.getUsername(), this.getProfileId());
     }
 
+    /**
+     * sends the player's inbound connection a packet
+     * @param packet the packet to send
+     */
     public void sendToPlayer(Packet packet) {
         if (!inboundConnection.getChannel().isActive()) {
             throw new IllegalStateException("tried sending player packet while inbound connection isn't active");
@@ -92,6 +115,10 @@ public class HyProxyPlayer implements CommandSender {
         inboundConnection.send(packet);
     }
 
+    /**
+     * sends the player's outbound connection a packet
+     * @param packet the packet to send
+     */
     public void sendAsPlayer(Packet packet) {
         if (!hasActiveOutboundConnection()) {
             throw new IllegalStateException("tried sending packet as player while outbound channel isn't active");
@@ -100,6 +127,9 @@ public class HyProxyPlayer implements CommandSender {
         outboundConnection.send(packet);
     }
 
+    /**
+     * internal: please don't call this!
+     */
     public void setConnectedBackend(HyProxyBackend backend) {
         if (this.connectedBackend != null) {
             throw new IllegalStateException("cannot call setConnectedBackend more then once, use sendPlayerToBackend to transfer players to other servers");
@@ -112,14 +142,26 @@ public class HyProxyPlayer implements CommandSender {
         this.referredBackend = null;
     }
 
+    /**
+     * disconnects the player with the disconnect type being a normal disconnect
+     * @param message the disconnect message
+     */
     public void disconnect(String message) {
         this.disconnect(message, DisconnectType.DISCONNECT);
     }
 
+    /**
+     * disconnects the player with the given disconnect type
+     * @param message the disconnect message
+     * @param type the disconnect type
+     */
     public void disconnect(String message, DisconnectType type) {
         this.inboundConnection.disconnect(message, type); // this will disconnect the outbound connection too
     }
 
+    /**
+     * internal: please don't call this!
+     */
     public void onDisconnect() {
         proxy.unregisterPlayer(this);
         if (this.connectedBackend != null) {
@@ -144,13 +186,49 @@ public class HyProxyPlayer implements CommandSender {
         this.inboundConnection.send(new ServerMessage((byte) 0, message.getFormatted()));
     }
 
+    /**
+     * performs a proxy command as the player
+     * <br /><br />
+     * note: this will <b>not</b> execute backend commands
+     * @param command the command to perform
+     * @return if the command was found (on the proxy) or not
+     */
     @Override
     public boolean performCommand(String command) {
         return proxy.getCommandManager().performCommand(this, command);
     }
 
+    /**
+     * @return all the player's permissions
+     */
+    public Set<String> getPermissions() {
+        Set<String> allPermissions = new HashSet<>();
+        for (PlayerPermissionProvider provider : proxy.getPlayerPermissionProviders()) {
+            allPermissions.addAll(provider.getPlayerPermissions(this));
+        }
+
+        return ImmutableSet.copyOf(allPermissions);
+    }
+
+    /**
+     * checks if the player has a permission
+     * @param permission the permission to check for
+     * @return if the player has the permission or not
+     */
     @Override
     public boolean hasPermission(String permission) {
-        return this.getPermissions().contains(permission);
+        for (PlayerPermissionProvider provider : proxy.getPlayerPermissionProviders()) {
+            if (provider.hasPermission(this, permission)) return true;
+        }
+
+        return false;
+    }
+
+    public QuicStreamChannel getQuicChannel(NetworkChannel type) {
+        return this.quicChannels.get(type);
+    }
+
+    public void setQuicChannel(NetworkChannel type, QuicStreamChannel channel) {
+        this.quicChannels.put(type, channel);
     }
 }

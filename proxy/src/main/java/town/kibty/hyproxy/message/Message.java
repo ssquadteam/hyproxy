@@ -15,6 +15,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * a nicer interface to work with for hytale's protocol format for messages, {@link FormattedMessage}
+ */
 public class Message {
     @Delegate
     @Getter

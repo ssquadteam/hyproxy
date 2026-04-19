@@ -4,9 +4,9 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import lombok.experimental.UtilityClass;
 import org.jspecify.annotations.Nullable;
+import town.kibty.hyproxy.common.communication.ProxyCommunicationMessage;
 
 import java.util.Base64;
-import java.util.UUID;
 
 @UtilityClass
 public class ProxyCommunicationUtil {
@@ -62,40 +62,5 @@ public class ProxyCommunicationUtil {
         }
 
         return PROXY_COMMUNICATION_HEADER + Base64.getEncoder().encodeToString(dump);
-    }
-
-    public sealed interface ProxyCommunicationMessage permits
-            ProxyCommunicationMessage.SendToBackend,
-            ProxyCommunicationMessage.Unknown
-    {
-        int getTypeId();
-        void serialize(ByteBuf buf);
-
-        record SendToBackend(String backendId, UUID targetId, UUID senderId) implements ProxyCommunicationMessage {
-            @Override
-            public void serialize(ByteBuf buf) {
-                ProtocolUtil.writeVarString(buf, backendId);
-                ProtocolUtil.writeUUID(buf, targetId);
-                ProtocolUtil.writeUUID(buf, senderId);
-            }
-
-            @Override
-            public int getTypeId() {
-                return 0;
-            }
-        }
-
-        record Unknown(byte[] data) implements ProxyCommunicationMessage {
-            @Override
-            public void serialize(ByteBuf buf) {
-                VarIntUtil.write(buf, data.length);
-                buf.writeBytes(data);
-            }
-
-            @Override
-            public int getTypeId() {
-                return -1;
-            }
-        }
     }
 }

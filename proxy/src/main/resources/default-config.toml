@@ -12,6 +12,10 @@ ipv6-support = true
 # initial backend or backend set we should in order try to connect the user to.
 initial-backend = "main"
 
+# proxy communication allows backends to send a special packet that allows it to communicate with the proxy. you should turn this off if you have third party servers on your proxy.
+# note: this will not turn off custom proxy communication messages, only the built-in ones.
+proxy-communication = true
+
 # the backends the proxy will send players to
 [backends]
 main = "127.0.0.1:5521"

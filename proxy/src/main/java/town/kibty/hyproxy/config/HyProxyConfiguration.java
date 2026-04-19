@@ -38,6 +38,8 @@ public class HyProxyConfiguration {
     private boolean ipv6Support;
 
     private String initialBackend;
+    private boolean proxyCommunicationEnabled;
+
     private Map<String, String> backends;
     private Map<String, List<String>> permissions;
 
@@ -180,6 +182,8 @@ public class HyProxyConfiguration {
             boolean ipv6Support = config.getOrElse("ipv6-support", true);
 
             String initialBackend = config.getOrElse("initial-backend", "main");
+            boolean proxyCommunicationEnabled = config.getOrElse("proxy-communication", true);
+
             CommentedConfig backendConfig = config.get("backends");
             Map<String, String> backends = backendConfig.valueMap()
                     .entrySet()
@@ -202,6 +206,7 @@ public class HyProxyConfiguration {
                     publicIp,
                     ipv6Support,
                     initialBackend,
+                    proxyCommunicationEnabled,
                     backends,
                     permissions
             );

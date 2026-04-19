@@ -16,18 +16,55 @@ import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.quic.QuicChannel;
 import io.netty.handler.codec.quic.QuicStreamChannel;
+import io.netty.handler.codec.quic.QuicStreamPriority;
+import io.netty.handler.codec.quic.QuicStreamType;
 import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.SystemPropertyUtil;
 import lombok.experimental.UtilityClass;
+import town.kibty.hyproxy.HyProxy;
+import town.kibty.hyproxy.io.HytaleConnection;
+import town.kibty.hyproxy.io.PacketDecoder;
+import town.kibty.hyproxy.io.PacketEncoder;
+import town.kibty.hyproxy.io.proto.NetworkChannel;
+import town.kibty.hyproxy.player.HyProxyPlayer;
 
 import java.lang.reflect.Constructor;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ThreadFactory;
 
 @UtilityClass
 public class NettyUtil {
+    public static CompletableFuture<Void> createForwardingStream(HytaleConnection connection, QuicChannel conn, QuicStreamType streamType, NetworkChannel networkChannel, QuicStreamPriority priority, HyProxyPlayer player) {
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        conn.createStream(streamType, new ChannelInitializer<>() {
+            @Override
+            protected void initChannel(Channel channel) {
+                //channel.pipeline().addLast("timeout", new ReadTimeoutHandler(10L, TimeUnit.SECONDS));
+                channel.pipeline().addLast("decoder", new PacketDecoder());
+                channel.pipeline().addLast("encoder", new PacketEncoder());
+            }
+        }).addListener(result -> {
+            if (!result.isSuccess()) {
+                future.completeExceptionally(result.cause());
+                return;
+            }
+
+            QuicStreamChannel channel = (QuicStreamChannel) result.getNow();
+            channel.attr(HyProxy.STREAM_CHANNEL_KEY).set(networkChannel);
+            if (priority != null) {
+                channel.updatePriority(priority);
+            }
+
+            connection.ensurePlayer().setQuicChannel(networkChannel, channel);
+            channel.pipeline().addLast("handler", connection);
+            future.complete(null);
+        });
+        return future;
+    }
+
     public EventLoopGroup getEventLoopGroup(String name) {
         return getEventLoopGroup(0, name);
     }

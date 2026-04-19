@@ -5,6 +5,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import town.kibty.hyproxy.backend.HyProxyBackend;
 import town.kibty.hyproxy.common.util.SecretMessageUtil;
+import town.kibty.hyproxy.event.impl.player.PlayerPreAuthConnectEvent;
 import town.kibty.hyproxy.io.HytaleConnection;
 import town.kibty.hyproxy.io.HytalePacketHandler;
 import town.kibty.hyproxy.io.packet.impl.Disconnect;
@@ -57,6 +58,24 @@ public class InboundInitialPacketHandler implements HytalePacketHandler {
             }
 
             player.setReferredBackend(backend);
+        }
+
+        PlayerPreAuthConnectEvent event = connection.getProxy().getEventBus().fire(new PlayerPreAuthConnectEvent(
+                player,
+                false
+        ));
+
+        if (event.isCanceled()) {
+            if (connection.isDisconnected()) {
+                return true;
+            }
+
+            connection.disconnect("proxy pre-auth connect event cancelled without disconnect");
+            return true;
+        }
+
+        if (connection.isDisconnected()) {
+            return true;
         }
 
         connection.setPlayer(player);

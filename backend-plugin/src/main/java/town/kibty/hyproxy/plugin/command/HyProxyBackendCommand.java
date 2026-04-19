@@ -8,11 +8,10 @@ import com.hypixel.hytale.server.core.command.system.arguments.system.RequiredAr
 import com.hypixel.hytale.server.core.command.system.arguments.types.ArgTypes;
 import com.hypixel.hytale.server.core.command.system.basecommands.AbstractCommandCollection;
 import com.hypixel.hytale.server.core.entity.entities.Player;
-import com.hypixel.hytale.server.core.universe.PlayerRef;
 import com.hypixel.hytale.server.core.universe.Universe;
 import org.jspecify.annotations.NonNull;
 import org.jspecify.annotations.Nullable;
-import town.kibty.hyproxy.common.util.ProxyCommunicationUtil;
+import town.kibty.hyproxy.common.communication.ProxyCommunicationMessage;
 import town.kibty.hyproxy.plugin.HyProxyBackendPlugin;
 
 import java.util.UUID;
@@ -54,7 +53,7 @@ public class HyProxyBackendCommand extends AbstractCommandCollection {
                 context.sendMessage(Message.raw("There is no players on the server to be able to relay the proxy communication message over."));
                 return CompletableFuture.completedFuture(null);
             }
-            plugin.sendProxyMessage(new ProxyCommunicationUtil.ProxyCommunicationMessage.SendToBackend(
+            plugin.sendProxyMessage(new ProxyCommunicationMessage.SendToBackend(
                     backendId,
                     targetId,
                     senderId

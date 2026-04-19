@@ -19,7 +19,7 @@ import java.util.Map;
 public class FormattedMessage {
     private @Nullable String rawText;
     private @Nullable String messageId;
-    private FormattedMessage @Nullable[] children;
+    private FormattedMessage @Nullable [] children;
     private @Nullable Map<String, ParamValue> params;
     private @Nullable Map<String, FormattedMessage> messageParams;
     private @Nullable String color;
@@ -122,7 +122,7 @@ public class FormattedMessage {
 
         Map<String, FormattedMessage> messageParams = null;
 
-        if((nullBits & 16) != 0) {
+        if ((nullBits & 16) != 0) {
             int oldOffset = buf.readerIndex();
             int offset = varsOffset + messageParamsOffset;
 
@@ -158,7 +158,7 @@ public class FormattedMessage {
         }
 
         String link = null;
-        if ((nullBits & 32) != 0) {
+        if ((nullBits & 64) != 0) {
             int offset = varsOffset + linksOffset;
             Pair<String, Integer> varString = ProtocolUtil.readVarString(buf, offset, 1024);
             link = varString.left();
@@ -185,31 +185,31 @@ public class FormattedMessage {
     public void serialize(ByteBuf buf) {
         byte nullBits = 0;
         if (this.rawText != null) {
-            nullBits = (byte)(nullBits | 1);
+            nullBits = (byte) (nullBits | 1);
         }
 
         if (this.messageId != null) {
-            nullBits = (byte)(nullBits | 2);
+            nullBits = (byte) (nullBits | 2);
         }
 
         if (this.children != null) {
-            nullBits = (byte)(nullBits | 4);
+            nullBits = (byte) (nullBits | 4);
         }
 
         if (this.params != null) {
-            nullBits = (byte)(nullBits | 8);
+            nullBits = (byte) (nullBits | 8);
         }
 
         if (this.messageParams != null) {
-            nullBits = (byte)(nullBits | 16);
+            nullBits = (byte) (nullBits | 16);
         }
 
         if (this.color != null) {
-            nullBits = (byte)(nullBits | 32);
+            nullBits = (byte) (nullBits | 32);
         }
 
         if (this.link != null) {
-            nullBits = (byte)(nullBits | 64);
+            nullBits = (byte) (nullBits | 64);
         }
 
         buf.writeByte(nullBits);
@@ -255,7 +255,6 @@ public class FormattedMessage {
             }
         }
 
-
         if (this.params != null) {
             buf.setIntLE(paramsOffsetSlot, buf.writerIndex() - varsOffset);
             VarIntUtil.write(buf, this.params.size());
@@ -280,7 +279,6 @@ public class FormattedMessage {
             buf.setIntLE(colorOffsetSlot, buf.writerIndex() - varsOffset);
             ProtocolUtil.writeVarString(buf, this.color);
         }
-
 
         if (this.link != null) {
             buf.setIntLE(linkOffsetSlot, buf.writerIndex() - varsOffset);

@@ -1,10 +1,8 @@
 package town.kibty.hyproxy.io;
 
 import io.netty.buffer.ByteBuf;
-import io.netty.channel.Channel;
-import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.*;
+import io.netty.handler.codec.quic.QuicStreamChannel;
 import io.netty.util.ReferenceCountUtil;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
@@ -16,19 +14,46 @@ import town.kibty.hyproxy.common.util.ProtocolUtil;
 import town.kibty.hyproxy.io.packet.Packet;
 import town.kibty.hyproxy.io.packet.impl.Disconnect;
 import town.kibty.hyproxy.io.proto.DisconnectType;
+import town.kibty.hyproxy.io.proto.NetworkChannel;
 import town.kibty.hyproxy.player.HyProxyPlayer;
 import town.kibty.hyproxy.util.NettyUtil;
+
+import java.util.HashMap;
+import java.util.Map;
 
 @Slf4j
 @RequiredArgsConstructor
 @Getter
+@ChannelHandler.Sharable
 public class HytaleConnection extends ChannelInboundHandlerAdapter {
+    // packet id -> channel type
+    private static final Map<Integer, NetworkChannel> FORWARDED_QUIC_PACKETS = new HashMap<>();
+
+    static {
+        FORWARDED_QUIC_PACKETS.put(131, NetworkChannel.CHUNKS);
+        FORWARDED_QUIC_PACKETS.put(132, NetworkChannel.CHUNKS);
+        FORWARDED_QUIC_PACKETS.put(133, NetworkChannel.CHUNKS);
+        FORWARDED_QUIC_PACKETS.put(134, NetworkChannel.CHUNKS);
+        FORWARDED_QUIC_PACKETS.put(135, NetworkChannel.CHUNKS);
+        FORWARDED_QUIC_PACKETS.put(136, NetworkChannel.CHUNKS);
+        FORWARDED_QUIC_PACKETS.put(140, NetworkChannel.CHUNKS);
+        FORWARDED_QUIC_PACKETS.put(141, NetworkChannel.CHUNKS);
+        FORWARDED_QUIC_PACKETS.put(142, NetworkChannel.CHUNKS);
+        FORWARDED_QUIC_PACKETS.put(143, NetworkChannel.CHUNKS);
+        FORWARDED_QUIC_PACKETS.put(144, NetworkChannel.CHUNKS);
+
+        FORWARDED_QUIC_PACKETS.put(241, NetworkChannel.WORLD_MAP);
+        FORWARDED_QUIC_PACKETS.put(242, NetworkChannel.WORLD_MAP);
+    }
+
     private final Channel channel;
     private final HyProxy proxy;
 
     private @Nullable HytalePacketHandler packetHandler;
     @Setter
     private @Nullable HyProxyPlayer player;
+    @Getter
+    private boolean disconnected = false;
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) {
@@ -43,6 +68,25 @@ public class HytaleConnection extends ChannelInboundHandlerAdapter {
                     this.packetHandler.handleGeneric(packet);
                 }
             } else if (msg instanceof ByteBuf buf) {
+                // hacky way of forwarding special hytale packets to the right quic channel
+                // todo: fix this, or go with QUIC for connecting to backends
+                int packetId = buf.getIntLE(buf.readerIndex() + 4);
+
+                NetworkChannel type = FORWARDED_QUIC_PACKETS.get(packetId);
+                if (type != null) {
+                    QuicStreamChannel channel = this.ensurePlayer().getQuicChannel(type);
+                    if (channel == null) {
+                        this.packetHandler.handleUnknown(buf);
+                        return;
+                    }
+
+                    if (channel.isActive()) {
+                        channel.writeAndFlush(buf.retain());
+                    }
+
+                    return;
+                }
+
                 this.packetHandler.handleUnknown(buf);
             }
         } finally {
@@ -83,7 +127,7 @@ public class HytaleConnection extends ChannelInboundHandlerAdapter {
             return;
         }
 
-        if (hasPlayer() && player.isAuthenticated()) {
+        if (this.hasPlayer() && player.isAuthenticated()) {
             log.error("exception caught while handling connection {}", this.getIdentifier(), cause);
         }
 
@@ -116,13 +160,23 @@ public class HytaleConnection extends ChannelInboundHandlerAdapter {
 
     public void disconnect(String message, DisconnectType type) {
         this.send(new Disconnect(message, type)).addListener(ProtocolUtil.CLOSE_ON_COMPLETE);
+        this.disconnected = true;
         if (this.hasPlayer()) {
             log.info("{} got disconnected: {}", this.getIdentifier(), message);
         }
     }
 
+    public @Nullable ChannelFuture write(Object msg) {
+        if (this.channel.isActive()) {
+            return this.channel.writeAndFlush(msg);
+        }
+
+        ReferenceCountUtil.release(msg);
+        return null;
+    }
+
     public ChannelFuture send(Packet packet) {
-        return this.channel.writeAndFlush(packet);
+        return this.write(packet);
     }
 
     public void close() {

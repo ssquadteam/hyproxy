@@ -1,19 +1,27 @@
 package town.kibty.hyproxy.io.handler.inbound;
 
+import io.netty.handler.codec.quic.QuicChannel;
+import io.netty.handler.codec.quic.QuicStreamChannel;
+import io.netty.handler.codec.quic.QuicStreamPriority;
+import io.netty.handler.codec.quic.QuicStreamType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import town.kibty.hyproxy.HyProxy;
 import town.kibty.hyproxy.auth.JWTVerifier;
+import town.kibty.hyproxy.event.impl.player.PlayerAuthSuccessEvent;
 import town.kibty.hyproxy.io.HytaleConnection;
 import town.kibty.hyproxy.io.HytalePacketHandler;
 import town.kibty.hyproxy.io.packet.impl.auth.AuthGrant;
 import town.kibty.hyproxy.io.packet.impl.auth.AuthToken;
 import town.kibty.hyproxy.io.packet.impl.auth.ServerAuthToken;
 import town.kibty.hyproxy.io.proto.ClientType;
+import town.kibty.hyproxy.io.proto.NetworkChannel;
 import town.kibty.hyproxy.player.HyProxyPlayer;
+import town.kibty.hyproxy.util.NettyUtil;
 
 import java.security.cert.X509Certificate;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 @Slf4j
 @RequiredArgsConstructor
@@ -129,22 +137,53 @@ public class InboundAuthPacketHandler implements HytalePacketHandler {
                                     return;
                                 }
 
-                                // check again as another connection may have come through
-                                if (connection.getProxy().getPlayerByProfileId(connection.ensurePlayer().getProfileId()) != null) {
-                                    connection.disconnect("You are already connected to this proxy!");
-                                    return;
-                                }
-
-                                this.connection.send(new ServerAuthToken(serverAccessToken, null));
-                                log.info("{} successfully authenticated", this.connection.getIdentifier());
-                                player.setAuthenticated(true);
-
-                                this.connection.setPacketHandler(new InboundForwardingPacketHandler(this.connection));
+                                this.onAuthenticated(serverAccessToken);
                             });
                 });
 
         return true;
     }
+
+    private void onAuthenticated(String serverAccessToken) {
+        HyProxyPlayer player = connection.ensurePlayer();
+
+        // check again as another connection may have come through
+        if (connection.getProxy().getPlayerByProfileId(connection.ensurePlayer().getProfileId()) != null) {
+            connection.disconnect("You are already connected to this proxy!");
+            return;
+        }
+
+        PlayerAuthSuccessEvent event = connection.getProxy().getEventBus().fire(new PlayerAuthSuccessEvent(
+                player,
+                false
+        ));
+
+        if (event.isCanceled()) {
+            if (connection.isDisconnected()) {
+                return;
+            }
+
+            connection.disconnect("proxy auth success event cancelled without disconnect");
+            return;
+        }
+
+        if (connection.isDisconnected()) {
+            return;
+        }
+
+        QuicChannel quicChannel = ((QuicStreamChannel) connection.getChannel()).parent();
+        CompletableFuture.allOf(
+                NettyUtil.createForwardingStream(connection, quicChannel, QuicStreamType.UNIDIRECTIONAL, NetworkChannel.CHUNKS, new QuicStreamPriority(0, true), player),
+                NettyUtil.createForwardingStream(connection, quicChannel, QuicStreamType.UNIDIRECTIONAL, NetworkChannel.WORLD_MAP, new QuicStreamPriority(1, true), player)
+        ).thenAccept(_ -> {
+            this.connection.send(new ServerAuthToken(serverAccessToken, null));
+            log.info("{} successfully authenticated", this.connection.getIdentifier());
+            player.setAuthenticated(true);
+
+            this.connection.setPacketHandler(new InboundForwardingPacketHandler(this.connection));
+        });
+    }
+
     enum AuthState {
         REQUESTING_AUTH_GRANT,
         AWAITING_AUTH_TOKEN,
