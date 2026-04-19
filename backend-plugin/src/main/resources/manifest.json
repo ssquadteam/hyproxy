@@ -10,6 +10,6 @@
     }
   ],
   "Website": "https://github.com/xyzeva/hyproxy",
-  "Main": "town.kibty.hyproxy.plugin.HyProxyBackendPlugin",
+  "Main": "ac.eva.hyproxy.plugin.HyProxyBackendPlugin",
   "ServerVersion": "*"
 }

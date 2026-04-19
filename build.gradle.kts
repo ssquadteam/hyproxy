@@ -1,5 +1,5 @@
 allprojects {
-    group = "town.kibty"
+    group = "ac.eva"
     version = "1.2"
 
     repositories {

@@ -1,0 +1,50 @@
+package ac.eva.hyproxy.io;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.ByteToMessageDecoder;
+import lombok.extern.slf4j.Slf4j;
+import ac.eva.hyproxy.io.packet.Packet;
+import ac.eva.hyproxy.io.packet.PacketRegistry;
+import ac.eva.hyproxy.common.util.ProtocolUtil;
+
+import java.util.List;
+
+@Slf4j
+public class PacketDecoder extends ByteToMessageDecoder {
+    private static final int MAX_PAYLOAD_LENGTH = 1677721600;
+
+    @Override
+    protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+        if (in.readableBytes() < 8) return;
+
+        in.markReaderIndex();
+        int originalReaderIndex = in.readerIndex();
+        int payloadLength = in.readIntLE();
+
+        if (payloadLength < 0 || payloadLength > MAX_PAYLOAD_LENGTH) {
+            in.skipBytes(in.readableBytes());
+            ProtocolUtil.closeConnection(ctx.channel());
+            return;
+        }
+
+        int packetId = in.readIntLE();
+        PacketRegistry.PacketInfo packetInfo = PacketRegistry.getPacketById(packetId);
+
+        if (in.readableBytes() < payloadLength) {
+            in.resetReaderIndex();
+            return;
+        }
+
+        if (packetInfo == null) {
+            out.add(in.copy(originalReaderIndex, 8 + payloadLength));
+            in.skipBytes(payloadLength);
+            return;
+        }
+
+        ByteBuf payload = in.readRetainedSlice(payloadLength);
+        Packet packet = packetInfo.deserializeFunction().apply(payload);
+        out.add(packet);
+        // log.info("decoded packet {} readable bytes: {}", packet, in.readableBytes());
+    }
+}

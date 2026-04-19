@@ -46,7 +46,7 @@ tasks.shadowJar {
 
     manifest {
         attributes (
-            "Main-Class" to "town.kibty.hyproxy.Main"
+            "Main-Class" to "ac.eva.hyproxy.Main"
         )
     }
 }
