@@ -70,7 +70,7 @@ public class InboundForwardingPacketHandler implements HytalePacketHandler {
         HyProxyPlayer player = connection.ensurePlayer();
 
         if (!player.hasActiveOutboundConnection()) return;
-        player.getOutboundConnection().write(buf);
+        player.getOutboundConnection().write(buf.retain());
     }
 
     @Override

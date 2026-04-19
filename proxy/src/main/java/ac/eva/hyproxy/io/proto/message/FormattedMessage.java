@@ -1,5 +1,6 @@
-package ac.eva.hyproxy.io.proto;
+package ac.eva.hyproxy.io.proto.message;
 
+import ac.eva.hyproxy.io.proto.MaybeBool;
 import io.netty.buffer.ByteBuf;
 import it.unimi.dsi.fastutil.Pair;
 import lombok.*;
@@ -28,6 +29,7 @@ public class FormattedMessage {
     private MaybeBool monospace = MaybeBool.NULL;
     private MaybeBool underlined = MaybeBool.NULL;
     private @Nullable String link;
+    private @Nullable FormattedMessageImage image;
     private boolean markupEnabled;
 
     public static FormattedMessage deserialize(ByteBuf buf) {
@@ -45,6 +47,7 @@ public class FormattedMessage {
         int messageParamsOffset = buf.readIntLE();
         int colorOffset = buf.readIntLE();
         int linksOffset = buf.readIntLE();
+        int imageOffset = buf.readIntLE();
 
         int varsOffset = buf.readerIndex();
 
@@ -165,6 +168,14 @@ public class FormattedMessage {
             readViaOffsets += varString.right();
         }
 
+        FormattedMessageImage image = null;
+        if ((nullBits & 128) != 0) {
+            int offset = varsOffset + imageOffset;
+            Pair<FormattedMessageImage, Integer> pair = FormattedMessageImage.deserialize(buf, offset);
+            image = pair.left();
+            readViaOffsets += pair.right();
+        }
+
         buf.readerIndex(varsOffset + readViaOffsets);
         return new FormattedMessage(
                 rawText,
@@ -178,6 +189,7 @@ public class FormattedMessage {
                 monospace,
                 underlined,
                 link,
+                image,
                 markupEnabled
         );
     }
@@ -212,6 +224,10 @@ public class FormattedMessage {
             nullBits = (byte) (nullBits | 64);
         }
 
+        if (this.image != null) {
+            nullBits = (byte) (nullBits | 128);
+        }
+
         buf.writeByte(nullBits);
         buf.writeByte(this.bold.getId());
         buf.writeByte(this.italic.getId());
@@ -232,6 +248,8 @@ public class FormattedMessage {
         int colorOffsetSlot = buf.writerIndex();
         buf.writeIntLE(-1);
         int linkOffsetSlot = buf.writerIndex();
+        buf.writeIntLE(-1);
+        int imageOffsetSlot = buf.writerIndex();
         buf.writeIntLE(-1);
 
         int varsOffset = buf.writerIndex();
@@ -283,6 +301,11 @@ public class FormattedMessage {
         if (this.link != null) {
             buf.setIntLE(linkOffsetSlot, buf.writerIndex() - varsOffset);
             ProtocolUtil.writeVarString(buf, this.link);
+        }
+
+        if (this.image != null) {
+            buf.setIntLE(imageOffsetSlot, buf.writerIndex() - varsOffset);
+            this.image.serialize(buf);
         }
     }
 }

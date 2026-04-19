@@ -7,7 +7,7 @@ import lombok.ToString;
 import org.jspecify.annotations.Nullable;
 import ac.eva.hyproxy.io.HytalePacketHandler;
 import ac.eva.hyproxy.io.packet.Packet;
-import ac.eva.hyproxy.io.proto.FormattedMessage;
+import ac.eva.hyproxy.io.proto.message.FormattedMessage;
 
 @RequiredArgsConstructor
 @Getter

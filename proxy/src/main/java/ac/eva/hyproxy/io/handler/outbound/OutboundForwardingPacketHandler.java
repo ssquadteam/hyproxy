@@ -41,7 +41,7 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
         HyProxyPlayer player = connection.ensurePlayer();
 
         if (!player.hasActiveInboundConnection()) return;
-        player.getInboundConnection().write(buf);
+        player.getInboundConnection().write(buf.retain());
     }
 
     // this should never happen in normal conditions, but we make it happen in the backend plugin to have a way for the backend
@@ -120,6 +120,7 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
         this.connection.ensurePlayer().sendToPlayer(new ServerInfo(
                 serverName + " (hyproxy)",
                 serverInfo.getMotd(),
+                serverInfo.getFallbackServer(),
                 serverInfo.getMaxPlayers()
         ));
         return true;

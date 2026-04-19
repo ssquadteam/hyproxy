@@ -3,6 +3,7 @@ package ac.eva.hyproxy.plugin;
 import com.hypixel.hytale.event.EventPriority;
 import com.hypixel.hytale.protocol.packets.auth.AuthGrant;
 import com.hypixel.hytale.server.core.HytaleServer;
+import com.hypixel.hytale.server.core.Message;
 import com.hypixel.hytale.server.core.command.system.CommandManager;
 import com.hypixel.hytale.server.core.event.events.player.PlayerSetupConnectEvent;
 import com.hypixel.hytale.server.core.plugin.JavaPlugin;
@@ -47,7 +48,7 @@ public class HyProxyBackendPlugin extends JavaPlugin {
         byte[] data = event.getReferralData();
         if (data  == null) {
             event.setCancelled(true);
-            event.setReason("cannot direct join hyproxy backend");
+            event.setReason(Message.raw("cannot direct join hyproxy backend"));
             return;
         }
 
@@ -66,14 +67,14 @@ public class HyProxyBackendPlugin extends JavaPlugin {
 
             if (message == null) {
                 event.setCancelled(true);
-                event.setReason("Invalid player info message (is your proxy secret valid?)");
+                event.setReason(Message.raw("invalid player info message (is your proxy secret and backend id valid?)"));
                 return;
             }
 
-            getLogger().at(Level.INFO).log("successfully authenticated player {} with hyproxy (remoteAddress={})", message.remoteAddress());
+            getLogger().at(Level.INFO).log("successfully authenticated player {} with hyproxy (remoteAddress={})", message.profileId(), message.remoteAddress());
         } catch (Throwable throwable) {
             event.setCancelled(true);
-            event.setReason("Internal error while verifying player information");
+            event.setReason(Message.raw("internal error while verifying player information"));
         }
     }
 

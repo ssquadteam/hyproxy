@@ -5,7 +5,7 @@ import com.nimbusds.jose.util.ArrayUtils;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import lombok.Getter;
 import lombok.experimental.Delegate;
-import ac.eva.hyproxy.io.proto.FormattedMessage;
+import ac.eva.hyproxy.io.proto.message.FormattedMessage;
 import ac.eva.hyproxy.io.proto.MaybeBool;
 import ac.eva.hyproxy.util.ColorUtil;
 
