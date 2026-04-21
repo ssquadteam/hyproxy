@@ -1,17 +1,14 @@
 package ac.eva.hyproxy.io.packet.impl;
 
+import ac.eva.hyproxy.io.HytalePacketHandler;
+import ac.eva.hyproxy.io.packet.Packet;
+import ac.eva.hyproxy.io.proto.DisconnectType;
 import ac.eva.hyproxy.io.proto.message.FormattedMessage;
 import io.netty.buffer.ByteBuf;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.ToString;
 import org.jspecify.annotations.Nullable;
-import ac.eva.hyproxy.io.HytalePacketHandler;
-import ac.eva.hyproxy.io.packet.Packet;
-import ac.eva.hyproxy.io.proto.DisconnectType;
-import ac.eva.hyproxy.common.util.ProtocolUtil;
-
-import java.nio.charset.StandardCharsets;
 
 @RequiredArgsConstructor
 @Getter

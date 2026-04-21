@@ -1,12 +1,5 @@
 package ac.eva.hyproxy.player;
 
-import com.google.common.collect.ImmutableSet;
-import io.netty.handler.codec.quic.QuicStreamChannel;
-import lombok.Getter;
-import lombok.RequiredArgsConstructor;
-import lombok.Setter;
-import lombok.extern.slf4j.Slf4j;
-import org.jspecify.annotations.Nullable;
 import ac.eva.hyproxy.HyProxy;
 import ac.eva.hyproxy.backend.HyProxyBackend;
 import ac.eva.hyproxy.command.CommandSender;
@@ -22,13 +15,17 @@ import ac.eva.hyproxy.io.proto.DisconnectType;
 import ac.eva.hyproxy.io.proto.NetworkChannel;
 import ac.eva.hyproxy.message.Message;
 import ac.eva.hyproxy.player.permission.PlayerPermissionProvider;
+import com.google.common.collect.ImmutableSet;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import org.jspecify.annotations.Nullable;
 
 import java.time.Instant;
 import java.util.HashSet;
-import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @Getter
@@ -63,7 +60,6 @@ public class HyProxyPlayer implements CommandSender {
     private boolean authenticated = false;
 
     private @Nullable HyProxyBackend connectedBackend;
-    private final Map<NetworkChannel, QuicStreamChannel> quicChannels = new ConcurrentHashMap<>();
 
     /**
      * sends a player to another backend. this will send the client a referral with special referral data
@@ -240,13 +236,5 @@ public class HyProxyPlayer implements CommandSender {
         }
 
         return false;
-    }
-
-    public QuicStreamChannel getQuicChannel(NetworkChannel type) {
-        return this.quicChannels.get(type);
-    }
-
-    public void setQuicChannel(NetworkChannel type, QuicStreamChannel channel) {
-        this.quicChannels.put(type, channel);
     }
 }

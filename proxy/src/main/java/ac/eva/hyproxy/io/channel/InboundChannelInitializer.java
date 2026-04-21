@@ -71,7 +71,7 @@ public class InboundChannelInitializer extends ChannelInitializer<QuicStreamChan
     }
 
     @Override
-    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
         ProtocolUtil.closeConnection(ctx.channel());
     }
 }

@@ -135,10 +135,6 @@ public class HytaleConnection extends ChannelInboundHandlerAdapter {
         }
     }
 
-    public boolean hasQuicStream(NetworkChannel channel) {
-        return this.streams.containsKey(channel);
-    }
-
     public void setQuicStream(NetworkChannel channel, QuicStreamChannel stream) {
         this.streams.put(channel, stream);
         this.channelsByStreamId.put(stream.streamId(), channel);
