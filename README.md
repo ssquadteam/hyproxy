@@ -25,7 +25,7 @@ after that, you need to grab the file called `proxy.secret` on the proxy's conte
 
 and then you need to add the following launch flags *after* the server jar
 ```
---transport TCP --auth-mode insecure
+--auth-mode insecure
 ```
 
 **only do this if you have the plugin installed, doing this without the plugin installed will open you upto SERIOUS security issues**

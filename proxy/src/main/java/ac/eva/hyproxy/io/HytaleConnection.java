@@ -1,7 +1,10 @@
 package ac.eva.hyproxy.io;
 
+import ac.eva.hyproxy.io.packet.impl.ServerDisconnect;
+import ac.eva.hyproxy.message.Message;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
+import io.netty.handler.codec.quic.QuicChannel;
 import io.netty.handler.codec.quic.QuicStreamChannel;
 import io.netty.util.ReferenceCountUtil;
 import lombok.Getter;
@@ -12,42 +15,23 @@ import org.jspecify.annotations.Nullable;
 import ac.eva.hyproxy.HyProxy;
 import ac.eva.hyproxy.common.util.ProtocolUtil;
 import ac.eva.hyproxy.io.packet.Packet;
-import ac.eva.hyproxy.io.packet.impl.Disconnect;
 import ac.eva.hyproxy.io.proto.DisconnectType;
 import ac.eva.hyproxy.io.proto.NetworkChannel;
 import ac.eva.hyproxy.player.HyProxyPlayer;
 import ac.eva.hyproxy.util.NettyUtil;
 
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @RequiredArgsConstructor
 @Getter
 @ChannelHandler.Sharable
 public class HytaleConnection extends ChannelInboundHandlerAdapter {
-    // packet id -> channel type
-    private static final Map<Integer, NetworkChannel> FORWARDED_QUIC_PACKETS = new HashMap<>();
-
-    static {
-        FORWARDED_QUIC_PACKETS.put(131, NetworkChannel.CHUNKS);
-        FORWARDED_QUIC_PACKETS.put(132, NetworkChannel.CHUNKS);
-        FORWARDED_QUIC_PACKETS.put(133, NetworkChannel.CHUNKS);
-        FORWARDED_QUIC_PACKETS.put(134, NetworkChannel.CHUNKS);
-        FORWARDED_QUIC_PACKETS.put(135, NetworkChannel.CHUNKS);
-        FORWARDED_QUIC_PACKETS.put(136, NetworkChannel.CHUNKS);
-        FORWARDED_QUIC_PACKETS.put(140, NetworkChannel.CHUNKS);
-        FORWARDED_QUIC_PACKETS.put(141, NetworkChannel.CHUNKS);
-        FORWARDED_QUIC_PACKETS.put(142, NetworkChannel.CHUNKS);
-        FORWARDED_QUIC_PACKETS.put(143, NetworkChannel.CHUNKS);
-        FORWARDED_QUIC_PACKETS.put(144, NetworkChannel.CHUNKS);
-
-        FORWARDED_QUIC_PACKETS.put(241, NetworkChannel.WORLD_MAP);
-        FORWARDED_QUIC_PACKETS.put(242, NetworkChannel.WORLD_MAP);
-    }
-
-    private final Channel channel;
+    private final QuicChannel channel;
     private final HyProxy proxy;
+    private final Map<NetworkChannel, QuicStreamChannel> streams = new ConcurrentHashMap<>();
+    private final Map<Long, NetworkChannel> channelsByStreamId = new ConcurrentHashMap<>();
 
     private @Nullable HytalePacketHandler packetHandler;
     @Setter
@@ -63,31 +47,16 @@ public class HytaleConnection extends ChannelInboundHandlerAdapter {
         }
 
         try {
+            QuicStreamChannel streamChannel = (QuicStreamChannel) ctx.channel();
+            long streamId = streamChannel.streamId();
+            NetworkChannel networkChannel = this.channelsByStreamId.getOrDefault(streamId, NetworkChannel.DEFAULT);
+
             if (msg instanceof Packet packet) {
                 if (!packet.handle(this.packetHandler)) {
-                    this.packetHandler.handleGeneric(packet);
+                    this.packetHandler.handleGeneric(networkChannel, packet);
                 }
             } else if (msg instanceof ByteBuf buf) {
-                // hacky way of forwarding special hytale packets to the right quic channel
-                // todo: fix this, or go with QUIC for connecting to backends
-                int packetId = buf.getIntLE(buf.readerIndex() + 4);
-
-                NetworkChannel type = FORWARDED_QUIC_PACKETS.get(packetId);
-                if (type != null) {
-                    QuicStreamChannel channel = this.ensurePlayer().getQuicChannel(type);
-                    if (channel == null) {
-                        this.packetHandler.handleUnknown(buf);
-                        return;
-                    }
-
-                    if (channel.isActive()) {
-                        channel.writeAndFlush(buf.retain());
-                    }
-
-                    return;
-                }
-
-                this.packetHandler.handleUnknown(buf);
+                this.packetHandler.handleUnknown(networkChannel, buf);
             }
         } finally {
             ReferenceCountUtil.release(msg);
@@ -159,20 +128,39 @@ public class HytaleConnection extends ChannelInboundHandlerAdapter {
     }
 
     public void disconnect(String message, DisconnectType type) {
-        this.send(new Disconnect(message, type)).addListener(ProtocolUtil.CLOSE_ON_COMPLETE);
+        this.send(new ServerDisconnect(Message.raw(message).getFormatted(), type)).addListener(ProtocolUtil.CLOSE_ON_COMPLETE);
         this.disconnected = true;
         if (this.hasPlayer()) {
             log.info("{} got disconnected: {}", this.getIdentifier(), message);
         }
     }
 
+    public boolean hasQuicStream(NetworkChannel channel) {
+        return this.streams.containsKey(channel);
+    }
+
+    public void setQuicStream(NetworkChannel channel, QuicStreamChannel stream) {
+        this.streams.put(channel, stream);
+        this.channelsByStreamId.put(stream.streamId(), channel);
+    }
+
     public @Nullable ChannelFuture write(Object msg) {
-        if (this.channel.isActive()) {
-            return this.channel.writeAndFlush(msg);
+        return this.write(NetworkChannel.DEFAULT, msg);
+    }
+
+    public @Nullable ChannelFuture write(NetworkChannel channel, Object msg) {
+        QuicStreamChannel stream = this.streams.get(channel);
+
+        if (stream != null && stream.isActive()) {
+            return stream.writeAndFlush(msg);
         }
 
         ReferenceCountUtil.release(msg);
         return null;
+    }
+
+    public ChannelFuture send(NetworkChannel channel, Packet packet) {
+        return this.write(channel, packet);
     }
 
     public ChannelFuture send(Packet packet) {

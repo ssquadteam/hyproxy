@@ -1,9 +1,10 @@
 package ac.eva.hyproxy.io.packet;
 
+import ac.eva.hyproxy.io.packet.impl.ClientDisconnect;
 import ac.eva.hyproxy.io.packet.impl.auth.*;
 import io.netty.buffer.ByteBuf;
 import ac.eva.hyproxy.io.packet.impl.ClientReferral;
-import ac.eva.hyproxy.io.packet.impl.Disconnect;
+import ac.eva.hyproxy.io.packet.impl.ServerDisconnect;
 import ac.eva.hyproxy.io.packet.impl.game.ChatMessage;
 import ac.eva.hyproxy.io.packet.impl.game.ServerMessage;
 import ac.eva.hyproxy.io.packet.impl.setup.ServerInfo;
@@ -19,7 +20,8 @@ public class PacketRegistry {
 
     static {
         register(new PacketInfo(0, Connect.class, Connect::deserialize));
-        register(new PacketInfo(1, Disconnect.class, Disconnect::deserialize));
+        register(new PacketInfo(1, ClientDisconnect.class, ClientDisconnect::deserialize));
+        register(new PacketInfo(2, ServerDisconnect.class, ServerDisconnect::deserialize));
         register(new PacketInfo(11, AuthGrant.class, AuthGrant::deserialize));
         register(new PacketInfo(12, AuthToken.class, AuthToken::deserialize));
         register(new PacketInfo(13, ServerAuthToken.class, ServerAuthToken::deserialize));

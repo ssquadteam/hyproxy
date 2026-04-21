@@ -1,5 +1,6 @@
 package ac.eva.hyproxy.io.handler.outbound;
 
+import ac.eva.hyproxy.io.proto.NetworkChannel;
 import io.netty.buffer.ByteBuf;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -29,19 +30,19 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
     }
 
     @Override
-    public void handleGeneric(Packet packet) {
+    public void handleGeneric(NetworkChannel channel, Packet packet) {
         HyProxyPlayer player = connection.ensurePlayer();
 
         if (!player.hasActiveInboundConnection()) return;
-        player.sendToPlayer(packet);
+        player.sendToPlayer(channel, packet);
     }
 
     @Override
-    public void handleUnknown(ByteBuf buf) {
+    public void handleUnknown(NetworkChannel channel, ByteBuf buf) {
         HyProxyPlayer player = connection.ensurePlayer();
 
         if (!player.hasActiveInboundConnection()) return;
-        player.getInboundConnection().write(buf.retain());
+        player.getInboundConnection().write(channel, buf.retain());
     }
 
     // this should never happen in normal conditions, but we make it happen in the backend plugin to have a way for the backend

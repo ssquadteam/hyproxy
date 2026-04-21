@@ -1,11 +1,5 @@
 package ac.eva.hyproxy.io.handler.inbound;
 
-import io.netty.handler.codec.quic.QuicChannel;
-import io.netty.handler.codec.quic.QuicStreamChannel;
-import io.netty.handler.codec.quic.QuicStreamPriority;
-import io.netty.handler.codec.quic.QuicStreamType;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
 import ac.eva.hyproxy.HyProxy;
 import ac.eva.hyproxy.auth.JWTVerifier;
 import ac.eva.hyproxy.event.impl.player.PlayerAuthSuccessEvent;
@@ -15,13 +9,12 @@ import ac.eva.hyproxy.io.packet.impl.auth.AuthGrant;
 import ac.eva.hyproxy.io.packet.impl.auth.AuthToken;
 import ac.eva.hyproxy.io.packet.impl.auth.ServerAuthToken;
 import ac.eva.hyproxy.io.proto.ClientType;
-import ac.eva.hyproxy.io.proto.NetworkChannel;
 import ac.eva.hyproxy.player.HyProxyPlayer;
-import ac.eva.hyproxy.util.NettyUtil;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 
 import java.security.cert.X509Certificate;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
 
 @Slf4j
 @RequiredArgsConstructor
@@ -171,17 +164,11 @@ public class InboundAuthPacketHandler implements HytalePacketHandler {
             return;
         }
 
-        QuicChannel quicChannel = ((QuicStreamChannel) connection.getChannel()).parent();
-        CompletableFuture.allOf(
-                NettyUtil.createForwardingStream(connection, quicChannel, QuicStreamType.UNIDIRECTIONAL, NetworkChannel.CHUNKS, new QuicStreamPriority(0, true), player),
-                NettyUtil.createForwardingStream(connection, quicChannel, QuicStreamType.UNIDIRECTIONAL, NetworkChannel.WORLD_MAP, new QuicStreamPriority(1, true), player)
-        ).thenAccept(_ -> {
-            this.connection.send(new ServerAuthToken(serverAccessToken, null));
-            log.info("{} successfully authenticated", this.connection.getIdentifier());
-            player.setAuthenticated(true);
+        this.connection.send(new ServerAuthToken(serverAccessToken, null));
+        log.info("{} successfully authenticated", this.connection.getIdentifier());
+        player.setAuthenticated(true);
 
-            this.connection.setPacketHandler(new InboundForwardingPacketHandler(this.connection));
-        });
+        this.connection.setPacketHandler(new InboundForwardingPacketHandler(this.connection));
     }
 
     enum AuthState {

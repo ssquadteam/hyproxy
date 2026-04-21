@@ -1,12 +1,12 @@
 package ac.eva.hyproxy.io;
 
+import ac.eva.hyproxy.common.util.ProtocolUtil;
+import ac.eva.hyproxy.io.packet.Packet;
+import ac.eva.hyproxy.io.packet.PacketRegistry;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import lombok.extern.slf4j.Slf4j;
-import ac.eva.hyproxy.io.packet.Packet;
-import ac.eva.hyproxy.io.packet.PacketRegistry;
-import ac.eva.hyproxy.common.util.ProtocolUtil;
 
 import java.util.List;
 
@@ -43,8 +43,11 @@ public class PacketDecoder extends ByteToMessageDecoder {
         }
 
         ByteBuf payload = in.readRetainedSlice(payloadLength);
-        Packet packet = packetInfo.deserializeFunction().apply(payload);
-        out.add(packet);
-        // log.info("decoded packet {} readable bytes: {}", packet, in.readableBytes());
+        try {
+            Packet packet = packetInfo.deserializeFunction().apply(payload);
+            out.add(packet);
+        } finally {
+            payload.release();
+        }
     }
 }

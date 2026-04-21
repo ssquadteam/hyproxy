@@ -1,5 +1,6 @@
 package ac.eva.hyproxy.io.handler.inbound;
 
+import ac.eva.hyproxy.io.packet.impl.ClientDisconnect;
 import io.netty.buffer.Unpooled;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -8,7 +9,6 @@ import ac.eva.hyproxy.common.util.SecretMessageUtil;
 import ac.eva.hyproxy.event.impl.player.PlayerPreAuthConnectEvent;
 import ac.eva.hyproxy.io.HytaleConnection;
 import ac.eva.hyproxy.io.HytalePacketHandler;
-import ac.eva.hyproxy.io.packet.impl.Disconnect;
 import ac.eva.hyproxy.io.packet.impl.auth.Connect;
 import ac.eva.hyproxy.player.HyProxyPlayer;
 
@@ -88,8 +88,8 @@ public class InboundInitialPacketHandler implements HytalePacketHandler {
     }
 
     @Override
-    public boolean handle(Disconnect disconnect) {
-        log.info("{} {}ed: {}", this.connection.getIdentifier(), disconnect.getType().name().toLowerCase(Locale.ROOT), disconnect.getReason());
+    public boolean handle(ClientDisconnect serverDisconnect) {
+        log.info("{} {}ed: {}", this.connection.getIdentifier(), serverDisconnect.getType().name().toLowerCase(Locale.ROOT), serverDisconnect.getReason());
         return true;
     }
 }

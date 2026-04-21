@@ -1,20 +1,18 @@
 package ac.eva.hyproxy.io;
 
+import ac.eva.hyproxy.io.packet.impl.ServerDisconnect;
+import ac.eva.hyproxy.message.Message;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
-import io.netty.handler.codec.quic.InsecureQuicTokenHandler;
-import io.netty.handler.codec.quic.QuicChannel;
-import io.netty.handler.codec.quic.QuicServerCodecBuilder;
-import io.netty.handler.codec.quic.QuicSslContext;
+import io.netty.handler.codec.quic.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.jspecify.annotations.Nullable;
 import ac.eva.hyproxy.HyProxy;
 import ac.eva.hyproxy.common.util.ProtocolUtil;
 import ac.eva.hyproxy.io.channel.InboundChannelInitializer;
-import ac.eva.hyproxy.io.packet.impl.Disconnect;
 import ac.eva.hyproxy.io.proto.DisconnectType;
 
 import javax.net.ssl.SSLEngine;
@@ -38,13 +36,17 @@ public class QuicChannelInboundHandlerAdapter extends ChannelInboundHandlerAdapt
         ChannelHandler handler = new QuicServerCodecBuilder()
                 .sslContext(this.sslContext)
                 .tokenHandler(InsecureQuicTokenHandler.INSTANCE)
+                .activeMigration(false)
                 .maxIdleTimeout(1, TimeUnit.MINUTES)
                 .ackDelayExponent(3L)
-                .initialMaxData(524288L)
-                .initialMaxStreamDataUnidirectional(0L)
-                .initialMaxStreamDataBidirectionalLocal(131072L)
-                .initialMaxStreamDataBidirectionalRemote(131072L)
-                .initialMaxStreamsBidirectional(1L)
+                .initialMaxData(512 * 1024)
+                .initialMaxStreamDataUnidirectional(0)
+                .initialMaxStreamsUnidirectional(0)
+                .initialMaxStreamDataBidirectionalLocal(128 * 1024)
+                .initialMaxStreamDataBidirectionalRemote(128 * 1024)
+                .initialMaxStreamsBidirectional(8)
+                .discoverPmtu(true)
+                .congestionControlAlgorithm(QuicCongestionControlAlgorithm.BBR)
                 .handler(new ChannelInboundHandlerAdapter() {
                     @Override
                     public boolean isSharable() {
@@ -69,7 +71,7 @@ public class QuicChannelInboundHandlerAdapter extends ChannelInboundHandlerAdapt
 
                         Channel channel = ctx.channel();
                         if (channel.isWritable()) {
-                            channel.writeAndFlush(new Disconnect("Internal proxy error!", DisconnectType.CRASH)).addListener(ProtocolUtil.CLOSE_ON_COMPLETE);
+                            channel.writeAndFlush(new ServerDisconnect(Message.raw("Internal proxy error!").getFormatted(), DisconnectType.CRASH)).addListener(ProtocolUtil.CLOSE_ON_COMPLETE);
                             return;
                         }
 

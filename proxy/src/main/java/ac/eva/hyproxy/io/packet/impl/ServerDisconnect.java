@@ -1,5 +1,6 @@
 package ac.eva.hyproxy.io.packet.impl;
 
+import ac.eva.hyproxy.io.proto.message.FormattedMessage;
 import io.netty.buffer.ByteBuf;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
@@ -15,8 +16,8 @@ import java.nio.charset.StandardCharsets;
 @RequiredArgsConstructor
 @Getter
 @ToString
-public class Disconnect implements Packet {
-    private final @Nullable String reason;
+public class ServerDisconnect implements Packet {
+    private final @Nullable FormattedMessage reason;
     private final DisconnectType type;
 
     @Override
@@ -24,16 +25,16 @@ public class Disconnect implements Packet {
         return handler.handle(this);
     }
 
-    public static Disconnect deserialize(ByteBuf buf) {
+    public static ServerDisconnect deserialize(ByteBuf buf) {
         byte nullBits = buf.readByte();
         DisconnectType type = DisconnectType.getById(buf.readByte());
 
-        String reason = null;
+        FormattedMessage reason = null;
         if ((nullBits & 0x1) != 0) {
-            reason = ProtocolUtil.readVarString(buf, 1024);
+            reason = FormattedMessage.deserialize(buf);
         }
 
-        return new Disconnect(reason, type);
+        return new ServerDisconnect(reason, type);
     }
 
     @Override
@@ -47,7 +48,7 @@ public class Disconnect implements Packet {
         buf.writeByte(this.type.getId());
 
         if (this.reason != null) {
-            ProtocolUtil.writeVarString(buf, this.reason, StandardCharsets.UTF_8);
+            this.reason.serialize(buf);
         }
     }
 }

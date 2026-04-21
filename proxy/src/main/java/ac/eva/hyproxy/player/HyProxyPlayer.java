@@ -104,27 +104,45 @@ public class HyProxyPlayer implements CommandSender {
     }
 
     /**
-     * sends the player's inbound connection a packet
+     * sends the player's inbound connection a packet using the default network channel
      * @param packet the packet to send
      */
     public void sendToPlayer(Packet packet) {
-        if (!inboundConnection.getChannel().isActive()) {
-            throw new IllegalStateException("tried sending player packet while inbound connection isn't active");
-        }
-
-        inboundConnection.send(packet);
+        this.sendToPlayer(NetworkChannel.DEFAULT, packet);
     }
 
     /**
-     * sends the player's outbound connection a packet
+     * sends the player's inbound connection a packet using the specified network channel
+     * @param channel the channel to send to
+     * @param packet the packet to send
+     */
+    public void sendToPlayer(NetworkChannel channel, Packet packet) {
+        if (!hasActiveInboundConnection()) {
+            throw new IllegalStateException("tried sending player packet while inbound connection isn't active");
+        }
+
+        inboundConnection.send(channel, packet);
+    }
+
+    /**
+     * sends the player's outbound connection a packet using the default network channel
      * @param packet the packet to send
      */
     public void sendAsPlayer(Packet packet) {
+       this.sendAsPlayer(NetworkChannel.DEFAULT, packet);
+    }
+
+    /**
+     * sends the player's outbound connection a packet using the specified network channel
+     * @param channel the channel to send to
+     * @param packet the packet to send
+     */
+    public void sendAsPlayer(NetworkChannel channel, Packet packet) {
         if (!hasActiveOutboundConnection()) {
             throw new IllegalStateException("tried sending packet as player while outbound channel isn't active");
         }
 
-        outboundConnection.send(packet);
+        outboundConnection.send(channel, packet);
     }
 
     /**

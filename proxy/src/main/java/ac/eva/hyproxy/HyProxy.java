@@ -1,5 +1,6 @@
 package ac.eva.hyproxy;
 
+import ac.eva.hyproxy.io.HytaleConnection;
 import com.google.common.collect.ImmutableList;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.ChannelFuture;
@@ -51,7 +52,8 @@ import java.util.concurrent.ConcurrentHashMap;
 @Log4j2
 public class HyProxy {
     public static final AttributeKey<X509Certificate> CLIENT_CERTIFICATE_ATTR = AttributeKey.valueOf("CLIENT_CERTIFICATE");
-    public static final AttributeKey<NetworkChannel> STREAM_CHANNEL_KEY = AttributeKey.newInstance("STREAM_CHANNEL_ID");
+    public static final AttributeKey<HytaleConnection> HYTALE_CONNECTION_ATTR = AttributeKey.newInstance("HYTALE_CONNECTION");
+
     private static final EventLoopGroup WORKER_GROUP = NettyUtil.getEventLoopGroup("hyproxy-worker-group");
 
     private Bootstrap bootstrapIpv4 = null;
@@ -73,7 +75,7 @@ public class HyProxy {
     @Getter
     private final JWTVerifier jwtVerifier = new JWTVerifier(this);
     @Getter
-    private X509Certificate serverCert;
+    private SelfSignedCertificate certificate;
 
     private final Map<UUID, HyProxyPlayer> playersByProfileId = new ConcurrentHashMap<>();
     private final Map<String, HyProxyPlayer> playersByUsername = new ConcurrentHashMap<>();
@@ -91,11 +93,10 @@ public class HyProxy {
 
     public HyProxy() {
         try {
-            SelfSignedCertificate selfSignedCertificate = new SelfSignedCertificate("localhost");
-            this.serverCert = selfSignedCertificate.cert();
+            this.certificate = new SelfSignedCertificate("localhost");
 
             QuicSslContext sslContext = QuicSslContextBuilder
-                    .forServer(selfSignedCertificate.key(), null, selfSignedCertificate.cert())
+                    .forServer(this.certificate.key(), null, this.certificate.cert())
                     .applicationProtocols("hytale/2")
                     .earlyData(false).clientAuth(ClientAuth.REQUIRE)
                     .trustManager(InsecureTrustManagerFactory.INSTANCE)
@@ -446,6 +447,6 @@ public class HyProxy {
     }
 
     public String getServerCertFingerprint() {
-        return CertificateUtil.computeCertificateFingerprint(this.serverCert);
+        return CertificateUtil.computeCertificateFingerprint(this.certificate.cert());
     }
 }
