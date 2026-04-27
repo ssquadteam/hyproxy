@@ -21,8 +21,10 @@ import ac.eva.hyproxy.message.Message;
 import ac.eva.hyproxy.player.HyProxyPlayer;
 import com.github.luben.zstd.Zstd;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
@@ -40,9 +42,12 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
     private static final int CLIENT_READY_PACKET_ID = 105;
     private static final int CLIENT_TELEPORT_PACKET_ID = 109;
     private static final int ENTITY_UPDATES_PACKET_ID = 161;
+    private static final int COMPONENT_UPDATE_TYPE_EQUIPMENT = 7;
+    private static final int COMPONENT_UPDATE_TYPE_ENTITY_STATS = 8;
     private static final int DEFAULT_VIEW_RADIUS = 192;
     private static final int SHARD_ENTITY_ID_RANGE_SIZE = 1_000_000;
     private static final int MAX_TRACKED_ENTITY_UPDATES_PAYLOAD_SIZE = 16 * 1024 * 1024;
+    private static final int MAX_PROTOCOL_ARRAY_COUNT = 4_096_000;
     private static final int SHARDTALE_HANDOFF_VERSION = 1;
     private static final int SHARDTALE_HANDOFF_PAYLOAD_BYTES = 26;
     private static final long SEAMLESS_SETUP_KICK_DELAY_MILLIS = 300L;
@@ -102,8 +107,12 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
                 player.setCurrentClientEntityId(clientEntityId);
             }
         }
+        EntityUpdatesForwardingDecision entityUpdatesForwardingDecision = EntityUpdatesForwardingDecision.forwardOriginal();
         if (channel == NetworkChannel.DEFAULT && packetId == ENTITY_UPDATES_PACKET_ID) {
-            this.trackPotentialBackendEntityIds(player, buf);
+            entityUpdatesForwardingDecision = this.handleEntityUpdates(player, buf);
+            if (entityUpdatesForwardingDecision.drop()) {
+                return;
+            }
         }
 
         if (channel == NetworkChannel.DEFAULT && player.isSeamlessSwitching() && packetId == JOIN_WORLD_PACKET_ID) {
@@ -130,7 +139,11 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
             return;
         }
 
-        player.getInboundConnection().write(channel, buf.retain());
+        if (entityUpdatesForwardingDecision.replacement() != null) {
+            player.getInboundConnection().write(channel, entityUpdatesForwardingDecision.replacement());
+        } else {
+            player.getInboundConnection().write(channel, buf.retain());
+        }
         if (channel == NetworkChannel.DEFAULT && packetId == SET_CLIENT_ID_PACKET_ID) {
             this.finishSeamlessClientActivation(player);
         }
@@ -436,32 +449,1086 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
         player.getInboundConnection().write(NetworkChannel.DEFAULT, clientTeleportPacket(teleportId, correction));
     }
 
-    private void trackPotentialBackendEntityIds(HyProxyPlayer player, ByteBuf packet) {
+    private EntityUpdatesForwardingDecision handleEntityUpdates(HyProxyPlayer player, ByteBuf packet) {
+        byte[] compressedPayload = compressedPayload(packet);
+        if (compressedPayload == null) {
+            return EntityUpdatesForwardingDecision.forwardOriginal();
+        }
+
+        byte[] payload = decompressEntityUpdatesPayload(compressedPayload);
+        if (payload == null) {
+            return EntityUpdatesForwardingDecision.forwardOriginal();
+        }
+
+        this.trackPotentialBackendEntityIds(player, payload);
+        return this.dedupeLocalPlayerStateResync(player, payload);
+    }
+
+    private void trackPotentialBackendEntityIds(HyProxyPlayer player, byte[] payload) {
         int entityIdBase = entityIdBaseForBackend(player);
         if (entityIdBase < 0) {
             return;
         }
 
         int entityIdMaxExclusive = entityIdBase + SHARD_ENTITY_ID_RANGE_SIZE;
-        int payloadLength = payloadLength(packet);
-        if (payloadLength <= 0 || packet.readableBytes() < 8 + payloadLength) {
-            return;
-        }
-
-        byte[] compressedPayload = new byte[payloadLength];
-        packet.getBytes(packet.readerIndex() + 8, compressedPayload);
-
-        byte[] payload = decompressEntityUpdatesPayload(compressedPayload);
-        if (payload == null) {
-            return;
-        }
-
         for (int offset = 0; offset <= payload.length - 4; offset++) {
             int candidateEntityId = littleEndianInt(payload, offset);
             if (candidateEntityId >= entityIdBase && candidateEntityId < entityIdMaxExclusive) {
                 player.rememberTrackedBackendEntityId(candidateEntityId);
             }
         }
+    }
+
+    private EntityUpdatesForwardingDecision dedupeLocalPlayerStateResync(HyProxyPlayer player, byte[] payload) {
+        int localEntityId = player.getCurrentClientEntityId();
+        if (localEntityId < 0) {
+            return EntityUpdatesForwardingDecision.forwardOriginal();
+        }
+
+        ParsedEntityUpdates parsedPayload = parseEntityUpdatesPayload(payload);
+        if (parsedPayload == null || parsedPayload.updates() == null || parsedPayload.updates().isEmpty()) {
+            return EntityUpdatesForwardingDecision.forwardOriginal();
+        }
+
+        List<byte[]> serializedUpdates = new ArrayList<>(parsedPayload.updates().size());
+        int droppedComponents = 0;
+        int droppedEntityUpdates = 0;
+
+        for (ParsedEntityUpdate entityUpdate : parsedPayload.updates()) {
+            if (entityUpdate.networkId() != localEntityId || entityUpdate.updates() == null || entityUpdate.updates().isEmpty()) {
+                serializedUpdates.add(entityUpdate.originalBytes());
+                continue;
+            }
+
+            List<ParsedComponentUpdate> keptComponents = new ArrayList<>(entityUpdate.updates().size());
+            int entityDroppedComponents = 0;
+            for (ParsedComponentUpdate componentUpdate : entityUpdate.updates()) {
+                if (isDedupeComponentType(componentUpdate.typeId())
+                        && player.processLocalPlayerComponentUpdateForSeamlessDedupe(componentUpdate.typeId(), componentUpdate.bytes())) {
+                    entityDroppedComponents++;
+                    continue;
+                }
+
+                keptComponents.add(componentUpdate);
+            }
+
+            if (entityDroppedComponents == 0) {
+                serializedUpdates.add(entityUpdate.originalBytes());
+                continue;
+            }
+
+            droppedComponents += entityDroppedComponents;
+            byte[] serializedEntityUpdate = serializeEntityUpdate(
+                    entityUpdate.networkId(),
+                    entityUpdate.removedBytes(),
+                    keptComponents
+            );
+            if (serializedEntityUpdate == null) {
+                droppedEntityUpdates++;
+            } else {
+                serializedUpdates.add(serializedEntityUpdate);
+            }
+        }
+
+        if (droppedComponents == 0) {
+            return EntityUpdatesForwardingDecision.forwardOriginal();
+        }
+
+        byte[] rewrittenPayload = serializeEntityUpdatesPayload(parsedPayload.removedBytes(), serializedUpdates);
+        if (rewrittenPayload == null) {
+            log.info("{} skipped {} unchanged local-player equipment/stats component update(s) in {} entity update(s) from backend {} during seamless handoff",
+                    player.getIdentifier(),
+                    droppedComponents,
+                    droppedEntityUpdates,
+                    backend.getInfo().id());
+            return EntityUpdatesForwardingDecision.dropPacket();
+        }
+
+        log.info("{} skipped {} unchanged local-player equipment/stats component update(s) from backend {} during seamless handoff",
+                player.getIdentifier(),
+                droppedComponents,
+                backend.getInfo().id());
+        return EntityUpdatesForwardingDecision.replace(entityUpdatesPacket(rewrittenPayload));
+    }
+
+    private static boolean isDedupeComponentType(int componentType) {
+        return componentType == COMPONENT_UPDATE_TYPE_EQUIPMENT || componentType == COMPONENT_UPDATE_TYPE_ENTITY_STATS;
+    }
+
+    private static ByteBuf entityUpdatesPacket(byte[] uncompressedPayload) {
+        byte[] compressedPayload = Zstd.compress(uncompressedPayload, Zstd.defaultCompressionLevel());
+        ByteBuf packet = Unpooled.buffer(8 + compressedPayload.length);
+        packet.writeIntLE(compressedPayload.length);
+        packet.writeIntLE(ENTITY_UPDATES_PACKET_ID);
+        packet.writeBytes(compressedPayload);
+        return packet;
+    }
+
+    private static byte[] serializeEntityUpdatesPayload(byte[] removedBytes, List<byte[]> updates) {
+        if ((removedBytes == null || removedBytes.length == 0) && updates.isEmpty()) {
+            return null;
+        }
+
+        ByteBuf payload = Unpooled.buffer();
+        try {
+            byte nullBits = 0;
+            if (removedBytes != null) {
+                nullBits = (byte)(nullBits | 1);
+            }
+            if (!updates.isEmpty()) {
+                nullBits = (byte)(nullBits | 2);
+            }
+
+            payload.writeByte(nullBits);
+            int removedOffsetSlot = payload.writerIndex();
+            payload.writeIntLE(0);
+            int updatesOffsetSlot = payload.writerIndex();
+            payload.writeIntLE(0);
+            int variableBlockStart = payload.writerIndex();
+            if (removedBytes != null) {
+                payload.setIntLE(removedOffsetSlot, payload.writerIndex() - variableBlockStart);
+                payload.writeBytes(removedBytes);
+            } else {
+                payload.setIntLE(removedOffsetSlot, -1);
+            }
+
+            if (!updates.isEmpty()) {
+                payload.setIntLE(updatesOffsetSlot, payload.writerIndex() - variableBlockStart);
+                VarIntUtil.write(payload, updates.size());
+                for (byte[] update : updates) {
+                    payload.writeBytes(update);
+                }
+            } else {
+                payload.setIntLE(updatesOffsetSlot, -1);
+            }
+
+            return readableBytes(payload);
+        } finally {
+            payload.release();
+        }
+    }
+
+    private static byte[] serializeEntityUpdate(int networkId, byte[] removedBytes, List<ParsedComponentUpdate> updates) {
+        if ((removedBytes == null || removedBytes.length == 0) && updates.isEmpty()) {
+            return null;
+        }
+
+        ByteBuf payload = Unpooled.buffer();
+        try {
+            byte nullBits = 0;
+            if (removedBytes != null) {
+                nullBits = (byte)(nullBits | 1);
+            }
+            if (!updates.isEmpty()) {
+                nullBits = (byte)(nullBits | 2);
+            }
+
+            payload.writeByte(nullBits);
+            payload.writeIntLE(networkId);
+            int removedOffsetSlot = payload.writerIndex();
+            payload.writeIntLE(0);
+            int updatesOffsetSlot = payload.writerIndex();
+            payload.writeIntLE(0);
+            int variableBlockStart = payload.writerIndex();
+            if (removedBytes != null) {
+                payload.setIntLE(removedOffsetSlot, payload.writerIndex() - variableBlockStart);
+                payload.writeBytes(removedBytes);
+            } else {
+                payload.setIntLE(removedOffsetSlot, -1);
+            }
+
+            if (!updates.isEmpty()) {
+                payload.setIntLE(updatesOffsetSlot, payload.writerIndex() - variableBlockStart);
+                VarIntUtil.write(payload, updates.size());
+                for (ParsedComponentUpdate update : updates) {
+                    payload.writeBytes(update.bytes());
+                }
+            } else {
+                payload.setIntLE(updatesOffsetSlot, -1);
+            }
+
+            return readableBytes(payload);
+        } finally {
+            payload.release();
+        }
+    }
+
+    private static ParsedEntityUpdates parseEntityUpdatesPayload(byte[] payload) {
+        try {
+            if (!hasBytes(payload, 0, 9)) {
+                return null;
+            }
+
+            int nullBits = payload[0] & 0xFF;
+            byte[] removedBytes = null;
+            if ((nullBits & 1) != 0) {
+                int removedPosition = variableFieldPosition(payload, 0, 9, 1);
+                int removedEnd = fixedArrayEnd(payload, removedPosition, 4);
+                if (removedEnd < 0) {
+                    return null;
+                }
+                removedBytes = Arrays.copyOfRange(payload, removedPosition, removedEnd);
+            }
+
+            List<ParsedEntityUpdate> updates = null;
+            if ((nullBits & 2) != 0) {
+                int updatesPosition = variableFieldPosition(payload, 0, 9, 5);
+                VarIntRead updatesCount = readVarInt(payload, updatesPosition);
+                if (updatesCount == null || updatesCount.value() > MAX_PROTOCOL_ARRAY_COUNT) {
+                    return null;
+                }
+
+                int position = updatesPosition + updatesCount.length();
+                updates = new ArrayList<>(Math.min(updatesCount.value(), 1024));
+                for (int i = 0; i < updatesCount.value(); i++) {
+                    ParsedEntityUpdate update = parseEntityUpdate(payload, position);
+                    if (update == null) {
+                        return null;
+                    }
+                    updates.add(update);
+                    position += update.originalBytes().length;
+                }
+            }
+
+            return new ParsedEntityUpdates(removedBytes, updates);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    private static ParsedEntityUpdate parseEntityUpdate(byte[] payload, int offset) {
+        if (!hasBytes(payload, offset, 13)) {
+            return null;
+        }
+
+        int nullBits = payload[offset] & 0xFF;
+        int maxEnd = offset + 13;
+        int networkId = littleEndianInt(payload, offset + 1);
+        byte[] removedBytes = null;
+        if ((nullBits & 1) != 0) {
+            int removedPosition = variableFieldPosition(payload, offset, 13, 5);
+            int removedEnd = fixedArrayEnd(payload, removedPosition, 1);
+            if (removedEnd < 0) {
+                return null;
+            }
+            removedBytes = Arrays.copyOfRange(payload, removedPosition, removedEnd);
+            maxEnd = Math.max(maxEnd, removedEnd);
+        }
+
+        List<ParsedComponentUpdate> updates = null;
+        if ((nullBits & 2) != 0) {
+            int updatesPosition = variableFieldPosition(payload, offset, 13, 9);
+            VarIntRead updatesCount = readVarInt(payload, updatesPosition);
+            if (updatesCount == null || updatesCount.value() > MAX_PROTOCOL_ARRAY_COUNT) {
+                return null;
+            }
+
+            int position = updatesPosition + updatesCount.length();
+            updates = new ArrayList<>(Math.min(updatesCount.value(), 64));
+            for (int i = 0; i < updatesCount.value(); i++) {
+                ParsedComponentUpdate update = parseComponentUpdate(payload, position);
+                if (update == null) {
+                    return null;
+                }
+                updates.add(update);
+                position += update.bytes().length;
+            }
+            maxEnd = Math.max(maxEnd, position);
+        }
+
+        if (!hasBytes(payload, offset, maxEnd - offset)) {
+            return null;
+        }
+
+        return new ParsedEntityUpdate(
+                networkId,
+                removedBytes,
+                updates,
+                Arrays.copyOfRange(payload, offset, maxEnd)
+        );
+    }
+
+    private static ParsedComponentUpdate parseComponentUpdate(byte[] payload, int offset) {
+        VarIntRead typeId = readVarInt(payload, offset);
+        if (typeId == null) {
+            return null;
+        }
+
+        int bodyOffset = offset + typeId.length();
+        int bodyLength = componentUpdateBodyBytesConsumed(typeId.value(), payload, bodyOffset);
+        if (bodyLength < 0 || !hasBytes(payload, bodyOffset, bodyLength)) {
+            return null;
+        }
+
+        return new ParsedComponentUpdate(
+                typeId.value(),
+                Arrays.copyOfRange(payload, offset, bodyOffset + bodyLength)
+        );
+    }
+
+    private static int componentUpdateBodyBytesConsumed(int typeId, byte[] bytes, int offset) {
+        return switch (typeId) {
+            case 0 -> varStringBytesConsumed(bytes, offset);
+            case 1 -> fixedArrayBytesConsumed(bytes, offset, 4);
+            case 2 -> {
+                if (!hasBytes(bytes, offset, 4)) {
+                    yield -1;
+                }
+                int end = varStringEnd(bytes, offset + 4);
+                yield end < 0 ? -1 : end - offset;
+            }
+            case 3 -> modelUpdateBytesConsumed(bytes, offset);
+            case 4 -> playerSkinUpdateBytesConsumed(bytes, offset);
+            case 5 -> itemUpdateBytesConsumed(bytes, offset);
+            case 6 -> fixedBytesConsumed(bytes, offset, 8);
+            case 7 -> equipmentUpdateBytesConsumed(bytes, offset);
+            case 8 -> entityStatsUpdateBytesConsumed(bytes, offset);
+            case 9 -> fixedBytesConsumed(bytes, offset, 49);
+            case 10 -> fixedBytesConsumed(bytes, offset, 23);
+            case 11 -> entityEffectsUpdateBytesConsumed(bytes, offset);
+            case 12 -> interactionsUpdateBytesConsumed(bytes, offset);
+            case 13 -> fixedBytesConsumed(bytes, offset, 4);
+            case 14 -> interactableUpdateBytesConsumed(bytes, offset);
+            case 15, 16, 17, 23, 25 -> 0;
+            case 18, 19 -> fixedBytesConsumed(bytes, offset, 4);
+            case 20 -> fixedBytesConsumed(bytes, offset, 16);
+            case 21 -> fixedArrayBytesConsumed(bytes, offset, 4);
+            case 22 -> fixedBytesConsumed(bytes, offset, 48);
+            case 24 -> activeAnimationsUpdateBytesConsumed(bytes, offset);
+            default -> -1;
+        };
+    }
+
+    private static int modelUpdateBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 5)) {
+            return -1;
+        }
+
+        int position = offset + 5;
+        if ((bytes[offset] & 1) != 0) {
+            int modelLength = modelBytesConsumed(bytes, position, 0);
+            if (modelLength < 0) {
+                return -1;
+            }
+            position += modelLength;
+        }
+        return position - offset;
+    }
+
+    private static int playerSkinUpdateBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 1)) {
+            return -1;
+        }
+
+        int position = offset + 1;
+        if ((bytes[offset] & 1) != 0) {
+            int skinLength = playerSkinBytesConsumed(bytes, position);
+            if (skinLength < 0) {
+                return -1;
+            }
+            position += skinLength;
+        }
+        return position - offset;
+    }
+
+    private static int itemUpdateBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 4)) {
+            return -1;
+        }
+
+        int itemLength = itemWithAllMetadataBytesConsumed(bytes, offset + 4);
+        return itemLength < 0 ? -1 : 4 + itemLength;
+    }
+
+    private static int equipmentUpdateBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 13)) {
+            return -1;
+        }
+
+        int nullBits = bytes[offset] & 0xFF;
+        int maxEnd = offset + 13;
+        if ((nullBits & 1) != 0) {
+            int position = variableFieldPosition(bytes, offset, 13, 1);
+            VarIntRead count = readVarInt(bytes, position);
+            if (count == null || count.value() > MAX_PROTOCOL_ARRAY_COUNT) {
+                return -1;
+            }
+
+            position += count.length();
+            for (int i = 0; i < count.value(); i++) {
+                position = varStringEnd(bytes, position);
+                if (position < 0) {
+                    return -1;
+                }
+            }
+            maxEnd = Math.max(maxEnd, position);
+        }
+
+        if ((nullBits & 2) != 0) {
+            int end = varStringEnd(bytes, variableFieldPosition(bytes, offset, 13, 5));
+            if (end < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, end);
+        }
+
+        if ((nullBits & 4) != 0) {
+            int end = varStringEnd(bytes, variableFieldPosition(bytes, offset, 13, 9));
+            if (end < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, end);
+        }
+
+        return maxEnd - offset;
+    }
+
+    private static int entityStatsUpdateBytesConsumed(byte[] bytes, int offset) {
+        int position = offset;
+        VarIntRead dictionaryLength = readVarInt(bytes, position);
+        if (dictionaryLength == null || dictionaryLength.value() > MAX_PROTOCOL_ARRAY_COUNT) {
+            return -1;
+        }
+
+        position += dictionaryLength.length();
+        for (int i = 0; i < dictionaryLength.value(); i++) {
+            if (!hasBytes(bytes, position, 4)) {
+                return -1;
+            }
+            position += 4;
+
+            VarIntRead arrayLength = readVarInt(bytes, position);
+            if (arrayLength == null || arrayLength.value() > 64) {
+                return -1;
+            }
+            position += arrayLength.length();
+
+            for (int j = 0; j < arrayLength.value(); j++) {
+                int statUpdateLength = entityStatUpdateBytesConsumed(bytes, position);
+                if (statUpdateLength < 0) {
+                    return -1;
+                }
+                position += statUpdateLength;
+            }
+        }
+
+        return position - offset;
+    }
+
+    private static int entityStatUpdateBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 21)) {
+            return -1;
+        }
+
+        int nullBits = bytes[offset] & 0xFF;
+        int maxEnd = offset + 21;
+        if ((nullBits & 2) != 0) {
+            int position = variableFieldPosition(bytes, offset, 21, 13);
+            VarIntRead dictionaryLength = readVarInt(bytes, position);
+            if (dictionaryLength == null || dictionaryLength.value() > MAX_PROTOCOL_ARRAY_COUNT) {
+                return -1;
+            }
+
+            position += dictionaryLength.length();
+            for (int i = 0; i < dictionaryLength.value(); i++) {
+                position = varStringEnd(bytes, position);
+                if (position < 0 || !hasBytes(bytes, position, 6)) {
+                    return -1;
+                }
+                position += 6;
+            }
+            maxEnd = Math.max(maxEnd, position);
+        }
+
+        if ((nullBits & 4) != 0) {
+            int end = varStringEnd(bytes, variableFieldPosition(bytes, offset, 21, 17));
+            if (end < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, end);
+        }
+
+        return maxEnd - offset;
+    }
+
+    private static int entityEffectsUpdateBytesConsumed(byte[] bytes, int offset) {
+        VarIntRead count = readVarInt(bytes, offset);
+        if (count == null || count.value() > MAX_PROTOCOL_ARRAY_COUNT) {
+            return -1;
+        }
+
+        int position = offset + count.length();
+        for (int i = 0; i < count.value(); i++) {
+            int effectLength = entityEffectUpdateBytesConsumed(bytes, position);
+            if (effectLength < 0) {
+                return -1;
+            }
+            position += effectLength;
+        }
+        return position - offset;
+    }
+
+    private static int entityEffectUpdateBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 12)) {
+            return -1;
+        }
+
+        int position = offset + 12;
+        if ((bytes[offset] & 1) != 0) {
+            position = varStringEnd(bytes, position);
+            if (position < 0) {
+                return -1;
+            }
+        }
+        return position - offset;
+    }
+
+    private static int interactionsUpdateBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 9)) {
+            return -1;
+        }
+
+        int nullBits = bytes[offset] & 0xFF;
+        int position = variableFieldPosition(bytes, offset, 9, 1);
+        VarIntRead dictionaryLength = readVarInt(bytes, position);
+        if (dictionaryLength == null || dictionaryLength.value() > MAX_PROTOCOL_ARRAY_COUNT) {
+            return -1;
+        }
+
+        position += dictionaryLength.length();
+        long requiredPosition = position + dictionaryLength.value() * 5L;
+        if (requiredPosition > bytes.length) {
+            return -1;
+        }
+        int maxEnd = (int)requiredPosition;
+
+        if ((nullBits & 1) != 0) {
+            int tagsPosition = variableFieldPosition(bytes, offset, 9, 5);
+            int tagsLength = fixedArrayBytesConsumed(bytes, tagsPosition, 1);
+            if (tagsLength < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, tagsPosition + tagsLength);
+        }
+
+        return maxEnd - offset;
+    }
+
+    private static int interactableUpdateBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 1)) {
+            return -1;
+        }
+
+        int position = offset + 1;
+        if ((bytes[offset] & 1) != 0) {
+            position = varStringEnd(bytes, position);
+            if (position < 0) {
+                return -1;
+            }
+        }
+        return position - offset;
+    }
+
+    private static int activeAnimationsUpdateBytesConsumed(byte[] bytes, int offset) {
+        VarIntRead count = readVarInt(bytes, offset);
+        if (count == null || count.value() > MAX_PROTOCOL_ARRAY_COUNT) {
+            return -1;
+        }
+
+        int position = offset + count.length();
+        int bitfieldSize = (count.value() + 7) / 8;
+        if (!hasBytes(bytes, position, bitfieldSize)) {
+            return -1;
+        }
+
+        int bitfieldPosition = position;
+        position += bitfieldSize;
+        for (int i = 0; i < count.value(); i++) {
+            if ((bytes[bitfieldPosition + i / 8] & (1 << (i % 8))) != 0) {
+                position = varStringEnd(bytes, position);
+                if (position < 0) {
+                    return -1;
+                }
+            }
+        }
+
+        return position - offset;
+    }
+
+    private static int modelBytesConsumed(byte[] bytes, int offset, int depth) {
+        if (depth > 8 || !hasBytes(bytes, offset, 99)) {
+            return -1;
+        }
+
+        int nullBits0 = bytes[offset] & 0xFF;
+        int nullBits1 = bytes[offset + 1] & 0xFF;
+        int maxEnd = offset + 99;
+
+        int[] stringBits = {4, 8, 16, 32, 64};
+        int[] stringOffsetFields = {51, 55, 59, 63, 67};
+        for (int i = 0; i < stringBits.length; i++) {
+            if ((nullBits0 & stringBits[i]) != 0) {
+                int end = varStringEnd(bytes, variableFieldPosition(bytes, offset, 99, stringOffsetFields[i]));
+                if (end < 0) {
+                    return -1;
+                }
+                maxEnd = Math.max(maxEnd, end);
+            }
+        }
+
+        if ((nullBits0 & 128) != 0) {
+            int position = variableFieldPosition(bytes, offset, 99, 71);
+            int length = cameraSettingsBytesConsumed(bytes, position);
+            if (length < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, position + length);
+        }
+
+        if ((nullBits1 & 1) != 0) {
+            int position = variableFieldPosition(bytes, offset, 99, 75);
+            VarIntRead dictionaryLength = readVarInt(bytes, position);
+            if (dictionaryLength == null || dictionaryLength.value() > MAX_PROTOCOL_ARRAY_COUNT) {
+                return -1;
+            }
+
+            position += dictionaryLength.length();
+            for (int i = 0; i < dictionaryLength.value(); i++) {
+                position = varStringEnd(bytes, position);
+                if (position < 0) {
+                    return -1;
+                }
+                int animationSetLength = animationSetBytesConsumed(bytes, position);
+                if (animationSetLength < 0) {
+                    return -1;
+                }
+                position += animationSetLength;
+            }
+            maxEnd = Math.max(maxEnd, position);
+        }
+
+        if ((nullBits1 & 2) != 0) {
+            int position = variableFieldPosition(bytes, offset, 99, 79);
+            position = repeatedStructEnd(bytes, position, OutboundForwardingPacketHandler::modelAttachmentBytesConsumed);
+            if (position < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, position);
+        }
+
+        if ((nullBits1 & 4) != 0) {
+            int position = variableFieldPosition(bytes, offset, 99, 83);
+            position = repeatedStructEnd(bytes, position, OutboundForwardingPacketHandler::modelParticleBytesConsumed);
+            if (position < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, position);
+        }
+
+        if ((nullBits1 & 8) != 0) {
+            int position = variableFieldPosition(bytes, offset, 99, 87);
+            position = repeatedStructEnd(bytes, position, OutboundForwardingPacketHandler::modelTrailBytesConsumed);
+            if (position < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, position);
+        }
+
+        if ((nullBits1 & 16) != 0) {
+            int position = variableFieldPosition(bytes, offset, 99, 91);
+            VarIntRead dictionaryLength = readVarInt(bytes, position);
+            if (dictionaryLength == null || dictionaryLength.value() > MAX_PROTOCOL_ARRAY_COUNT) {
+                return -1;
+            }
+
+            position += dictionaryLength.length();
+            for (int i = 0; i < dictionaryLength.value(); i++) {
+                position = varStringEnd(bytes, position);
+                if (position < 0) {
+                    return -1;
+                }
+
+                int detailBoxArrayLength = fixedArrayBytesConsumed(bytes, position, 37);
+                if (detailBoxArrayLength < 0) {
+                    return -1;
+                }
+                position += detailBoxArrayLength;
+            }
+            maxEnd = Math.max(maxEnd, position);
+        }
+
+        if ((nullBits1 & 32) != 0) {
+            int position = variableFieldPosition(bytes, offset, 99, 95);
+            int phobiaModelLength = modelBytesConsumed(bytes, position, depth + 1);
+            if (phobiaModelLength < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, position + phobiaModelLength);
+        }
+
+        return maxEnd - offset;
+    }
+
+    private static int playerSkinBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 83)) {
+            return -1;
+        }
+
+        int maxEnd = offset + 83;
+        for (int i = 0; i < 20; i++) {
+            int bitByte = bytes[offset + i / 8] & 0xFF;
+            if ((bitByte & (1 << (i % 8))) == 0) {
+                continue;
+            }
+
+            int end = varStringEnd(bytes, variableFieldPosition(bytes, offset, 83, 3 + i * 4));
+            if (end < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, end);
+        }
+
+        return maxEnd - offset;
+    }
+
+    private static int itemWithAllMetadataBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 30)) {
+            return -1;
+        }
+
+        int maxEnd = varStringEnd(bytes, variableFieldPosition(bytes, offset, 30, 22));
+        if (maxEnd < 0) {
+            return -1;
+        }
+
+        if ((bytes[offset] & 1) != 0) {
+            int metadataEnd = varStringEnd(bytes, variableFieldPosition(bytes, offset, 30, 26));
+            if (metadataEnd < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, metadataEnd);
+        }
+
+        return maxEnd - offset;
+    }
+
+    private static int cameraSettingsBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 21)) {
+            return -1;
+        }
+
+        int nullBits = bytes[offset] & 0xFF;
+        int maxEnd = offset + 21;
+        if ((nullBits & 2) != 0) {
+            int position = variableFieldPosition(bytes, offset, 21, 13);
+            int length = cameraAxisBytesConsumed(bytes, position);
+            if (length < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, position + length);
+        }
+
+        if ((nullBits & 4) != 0) {
+            int position = variableFieldPosition(bytes, offset, 21, 17);
+            int length = cameraAxisBytesConsumed(bytes, position);
+            if (length < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, position + length);
+        }
+
+        return maxEnd - offset;
+    }
+
+    private static int cameraAxisBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 9)) {
+            return -1;
+        }
+
+        int position = offset + 9;
+        if ((bytes[offset] & 2) != 0) {
+            int length = fixedArrayBytesConsumed(bytes, position, 1);
+            if (length < 0) {
+                return -1;
+            }
+            position += length;
+        }
+        return position - offset;
+    }
+
+    private static int animationSetBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 17)) {
+            return -1;
+        }
+
+        int nullBits = bytes[offset] & 0xFF;
+        int maxEnd = offset + 17;
+        if ((nullBits & 2) != 0) {
+            int end = varStringEnd(bytes, variableFieldPosition(bytes, offset, 17, 9));
+            if (end < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, end);
+        }
+
+        if ((nullBits & 4) != 0) {
+            int position = variableFieldPosition(bytes, offset, 17, 13);
+            position = repeatedStructEnd(bytes, position, OutboundForwardingPacketHandler::animationBytesConsumed);
+            if (position < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, position);
+        }
+
+        return maxEnd - offset;
+    }
+
+    private static int animationBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 30)) {
+            return -1;
+        }
+
+        int nullBits = bytes[offset] & 0xFF;
+        int maxEnd = offset + 30;
+        if ((nullBits & 1) != 0) {
+            int end = varStringEnd(bytes, variableFieldPosition(bytes, offset, 30, 22));
+            if (end < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, end);
+        }
+
+        if ((nullBits & 2) != 0) {
+            int position = variableFieldPosition(bytes, offset, 30, 26);
+            int length = fixedArrayBytesConsumed(bytes, position, 4);
+            if (length < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, position + length);
+        }
+
+        return maxEnd - offset;
+    }
+
+    private static int modelAttachmentBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 17)) {
+            return -1;
+        }
+
+        int nullBits = bytes[offset] & 0xFF;
+        int maxEnd = offset + 17;
+        for (int i = 0; i < 4; i++) {
+            if ((nullBits & (1 << i)) == 0) {
+                continue;
+            }
+
+            int end = varStringEnd(bytes, variableFieldPosition(bytes, offset, 17, 1 + i * 4));
+            if (end < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, end);
+        }
+
+        return maxEnd - offset;
+    }
+
+    private static int modelParticleBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 42)) {
+            return -1;
+        }
+
+        int nullBits = bytes[offset] & 0xFF;
+        int maxEnd = offset + 42;
+        if ((nullBits & 8) != 0) {
+            int end = varStringEnd(bytes, variableFieldPosition(bytes, offset, 42, 34));
+            if (end < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, end);
+        }
+
+        if ((nullBits & 16) != 0) {
+            int end = varStringEnd(bytes, variableFieldPosition(bytes, offset, 42, 38));
+            if (end < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, end);
+        }
+
+        return maxEnd - offset;
+    }
+
+    private static int modelTrailBytesConsumed(byte[] bytes, int offset) {
+        if (!hasBytes(bytes, offset, 35)) {
+            return -1;
+        }
+
+        int nullBits = bytes[offset] & 0xFF;
+        int maxEnd = offset + 35;
+        if ((nullBits & 4) != 0) {
+            int end = varStringEnd(bytes, variableFieldPosition(bytes, offset, 35, 27));
+            if (end < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, end);
+        }
+
+        if ((nullBits & 8) != 0) {
+            int end = varStringEnd(bytes, variableFieldPosition(bytes, offset, 35, 31));
+            if (end < 0) {
+                return -1;
+            }
+            maxEnd = Math.max(maxEnd, end);
+        }
+
+        return maxEnd - offset;
+    }
+
+    private static int repeatedStructEnd(byte[] bytes, int offset, BytesConsumedFunction bytesConsumedFunction) {
+        VarIntRead count = readVarInt(bytes, offset);
+        if (count == null || count.value() > MAX_PROTOCOL_ARRAY_COUNT) {
+            return -1;
+        }
+
+        int position = offset + count.length();
+        for (int i = 0; i < count.value(); i++) {
+            int length = bytesConsumedFunction.bytesConsumed(bytes, position);
+            if (length < 0) {
+                return -1;
+            }
+            position += length;
+        }
+        return position;
+    }
+
+    private static int varStringBytesConsumed(byte[] bytes, int offset) {
+        int end = varStringEnd(bytes, offset);
+        return end < 0 ? -1 : end - offset;
+    }
+
+    private static int varStringEnd(byte[] bytes, int offset) {
+        VarIntRead stringLength = readVarInt(bytes, offset);
+        if (stringLength == null || stringLength.value() > MAX_PROTOCOL_ARRAY_COUNT) {
+            return -1;
+        }
+
+        long end = (long)offset + stringLength.length() + stringLength.value();
+        if (end > bytes.length) {
+            return -1;
+        }
+        return (int)end;
+    }
+
+    private static int fixedArrayBytesConsumed(byte[] bytes, int offset, int elementSize) {
+        int end = fixedArrayEnd(bytes, offset, elementSize);
+        return end < 0 ? -1 : end - offset;
+    }
+
+    private static int fixedArrayEnd(byte[] bytes, int offset, int elementSize) {
+        VarIntRead count = readVarInt(bytes, offset);
+        if (count == null || count.value() > MAX_PROTOCOL_ARRAY_COUNT) {
+            return -1;
+        }
+
+        long end = (long)offset + count.length() + (long)count.value() * elementSize;
+        if (end > bytes.length) {
+            return -1;
+        }
+        return (int)end;
+    }
+
+    private static int fixedBytesConsumed(byte[] bytes, int offset, int length) {
+        return hasBytes(bytes, offset, length) ? length : -1;
+    }
+
+    private static int variableFieldPosition(byte[] bytes, int structOffset, int variableBlockStart, int fieldOffsetOffset) {
+        if (!hasBytes(bytes, structOffset + fieldOffsetOffset, 4)) {
+            return -1;
+        }
+
+        int relativeOffset = littleEndianInt(bytes, structOffset + fieldOffsetOffset);
+        if (relativeOffset < 0) {
+            return -1;
+        }
+
+        long position = (long)structOffset + variableBlockStart + relativeOffset;
+        if (position < structOffset + (long)variableBlockStart || position > bytes.length) {
+            return -1;
+        }
+        return (int)position;
+    }
+
+    private static VarIntRead readVarInt(byte[] bytes, int offset) {
+        if (offset < 0 || offset >= bytes.length) {
+            return null;
+        }
+
+        int value = 0;
+        int shift = 0;
+        for (int i = 0; i < 5 && offset + i < bytes.length; i++) {
+            int current = bytes[offset + i] & 0xFF;
+            value |= (current & 0x7F) << shift;
+            if ((current & 0x80) == 0) {
+                if (value < 0) {
+                    return null;
+                }
+                return new VarIntRead(value, i + 1);
+            }
+            shift += 7;
+        }
+        return null;
+    }
+
+    private static boolean hasBytes(byte[] bytes, int offset, int length) {
+        return offset >= 0 && length >= 0 && offset <= bytes.length && length <= bytes.length - offset;
+    }
+
+    private static byte[] compressedPayload(ByteBuf packet) {
+        int payloadLength = payloadLength(packet);
+        if (payloadLength <= 0 || packet.readableBytes() < 8 + payloadLength) {
+            return null;
+        }
+
+        byte[] compressedPayload = new byte[payloadLength];
+        packet.getBytes(packet.readerIndex() + 8, compressedPayload);
+        return compressedPayload;
+    }
+
+    private static byte[] readableBytes(ByteBuf buf) {
+        byte[] bytes = new byte[buf.readableBytes()];
+        buf.getBytes(buf.readerIndex(), bytes);
+        return bytes;
+    }
+
+    @FunctionalInterface
+    private interface BytesConsumedFunction {
+        int bytesConsumed(byte[] bytes, int offset);
+    }
+
+    private record EntityUpdatesForwardingDecision(boolean drop, ByteBuf replacement) {
+        static EntityUpdatesForwardingDecision forwardOriginal() {
+            return new EntityUpdatesForwardingDecision(false, null);
+        }
+
+        static EntityUpdatesForwardingDecision dropPacket() {
+            return new EntityUpdatesForwardingDecision(true, null);
+        }
+
+        static EntityUpdatesForwardingDecision replace(ByteBuf replacement) {
+            return new EntityUpdatesForwardingDecision(false, replacement);
+        }
+    }
+
+    private record ParsedEntityUpdates(byte[] removedBytes, List<ParsedEntityUpdate> updates) {
+    }
+
+    private record ParsedEntityUpdate(int networkId, byte[] removedBytes, List<ParsedComponentUpdate> updates, byte[] originalBytes) {
+    }
+
+    private record ParsedComponentUpdate(int typeId, byte[] bytes) {
+    }
+
+    private record VarIntRead(int value, int length) {
     }
 
     private boolean handleShardTaleHandoffMessage(HyProxy proxy, byte[] data) {

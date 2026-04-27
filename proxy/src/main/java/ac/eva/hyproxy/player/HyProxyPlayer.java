@@ -32,7 +32,9 @@ import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Deque;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.UUID;
@@ -42,6 +44,7 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class HyProxyPlayer implements CommandSender {
     private static final int MAX_TRACKED_BACKEND_ENTITY_IDS = 65536;
+    private static final long SEAMLESS_LOCAL_STATE_DEDUPE_WINDOW_NANOS = TimeUnit.MILLISECONDS.toNanos(1_000L);
     public static final int SEAMLESS_STAGE_CONNECTING = 0;
     public static final int SEAMLESS_STAGE_FORWARDING = 1;
     public static final int SEAMLESS_STAGE_WORLD_SETTINGS = 2;
@@ -89,9 +92,11 @@ public class HyProxyPlayer implements CommandSender {
     private long seamlessHandoffSequence = 0;
     private int seamlessHandoffStage = -1;
     private String seamlessHandoffStageName = "idle";
+    private long seamlessLocalStateDedupeUntilNanos = 0L;
     @Setter
     private int currentClientEntityId = -1;
     private final Set<Integer> trackedBackendEntityIds = new HashSet<>();
+    private final Map<Integer, byte[]> latestLocalPlayerComponentUpdates = new HashMap<>();
     private @Nullable SeamlessTransferCorrection pendingSeamlessCorrection;
     private byte @Nullable [] latestViewRadiusPacket;
     private byte @Nullable [] latestPlayerOptionsPacket;
@@ -321,6 +326,7 @@ public class HyProxyPlayer implements CommandSender {
         this.clearForwardedBackendPings();
         this.seamlessHandoffStage = SEAMLESS_STAGE_PROMOTED;
         this.seamlessHandoffStageName = "promoted";
+        this.seamlessLocalStateDedupeUntilNanos = System.nanoTime() + SEAMLESS_LOCAL_STATE_DEDUPE_WINDOW_NANOS;
         this.connectedBackend.registerPlayer(this);
         this.referredBackend = null;
 
@@ -349,6 +355,7 @@ public class HyProxyPlayer implements CommandSender {
         this.pendingSeamlessGameplayReady = false;
         this.seamlessHandoffStage = -1;
         this.seamlessHandoffStageName = "idle";
+        this.seamlessLocalStateDedupeUntilNanos = 0L;
     }
 
     public void abortPendingSeamlessHandoff(
@@ -371,6 +378,7 @@ public class HyProxyPlayer implements CommandSender {
         this.pendingSeamlessGameplayReady = false;
         this.seamlessHandoffStage = -1;
         this.seamlessHandoffStageName = "idle";
+        this.seamlessLocalStateDedupeUntilNanos = 0L;
 
         if (pendingConnection != null && pendingConnection != oldOutboundConnection) {
             pendingConnection.setPacketHandler(new OutboundEmptyPacketHandler());
@@ -449,6 +457,34 @@ public class HyProxyPlayer implements CommandSender {
 
     public synchronized void clearTrackedBackendEntityIds() {
         this.trackedBackendEntityIds.clear();
+    }
+
+    public synchronized boolean processLocalPlayerComponentUpdateForSeamlessDedupe(int componentType, byte[] componentBytes) {
+        boolean dedupeActive = this.isSeamlessLocalStateDedupeWindowActiveLocked();
+        byte[] previous = this.latestLocalPlayerComponentUpdates.get(componentType);
+        if (dedupeActive && previous != null && Arrays.equals(previous, componentBytes)) {
+            return true;
+        }
+
+        this.latestLocalPlayerComponentUpdates.put(componentType, Arrays.copyOf(componentBytes, componentBytes.length));
+        return false;
+    }
+
+    public synchronized boolean isSeamlessLocalStateDedupeWindowActive() {
+        return this.isSeamlessLocalStateDedupeWindowActiveLocked();
+    }
+
+    private boolean isSeamlessLocalStateDedupeWindowActiveLocked() {
+        if (this.seamlessLocalStateDedupeUntilNanos == 0L) {
+            return false;
+        }
+
+        if (System.nanoTime() <= this.seamlessLocalStateDedupeUntilNanos) {
+            return true;
+        }
+
+        this.seamlessLocalStateDedupeUntilNanos = 0L;
+        return false;
     }
 
     public synchronized @Nullable SeamlessTransferCorrection consumePendingSeamlessCorrection() {
