@@ -12,8 +12,10 @@ import io.netty.channel.ChannelInitializer;
 import io.netty.handler.codec.quic.QuicStreamChannel;
 import lombok.RequiredArgsConstructor;
 import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
 
 @RequiredArgsConstructor
+@Slf4j
 public class OutboundChannelInitializer extends ChannelInitializer<QuicStreamChannel> {
     private final HyProxy proxy;
     private final HytaleConnection inboundConnection;
@@ -25,17 +27,44 @@ public class OutboundChannelInitializer extends ChannelInitializer<QuicStreamCha
     protected void initChannel(QuicStreamChannel channel) {
         long streamId = channel.streamId();
         NetworkChannel networkChannel = forcedNetworkChannel != null ? forcedNetworkChannel : NetworkChannel.fromStreamId(streamId);
+        if (networkChannel == null) {
+            log.warn("rejected unknown outbound stream {} for backend {}", streamId, backend.getInfo().id());
+            channel.close();
+            return;
+        }
 
         channel.pipeline().addLast("decoder", new PacketDecoder());
         channel.pipeline().addLast("encoder", new PacketEncoder());
 
         HyProxyPlayer player = inboundConnection.ensurePlayer();
-        HytaleConnection outboundConnection = player.getPendingOutboundConnection();
-        if (outboundConnection == null && (!player.isSeamlessSwitching() || player.getConnectedBackend() == backend)) {
+        HytaleConnection outboundConnection = null;
+        if (player.isSeamlessSwitching() && player.getPendingSeamlessBackend() == backend) {
+            outboundConnection = player.getPendingOutboundConnection();
+        } else if (!player.isSeamlessSwitching()
+                && (player.getConnectedBackend() == null || player.getConnectedBackend() == backend)) {
             outboundConnection = player.getOutboundConnection();
         }
 
-        if (outboundConnection == null && networkChannel == NetworkChannel.DEFAULT) {
+        if (outboundConnection == null) {
+            if (player.isSeamlessSwitching() && player.getPendingSeamlessBackend() != backend) {
+                String pendingBackendId = player.getPendingSeamlessBackend() == null ? "<unknown>" : player.getPendingSeamlessBackend().getInfo().id();
+                log.warn("{} rejected late outbound stream for backend {} while seamless handoff to {} is pending",
+                        player.getIdentifier(),
+                        backend.getInfo().id(),
+                        pendingBackendId);
+                channel.close();
+                return;
+            }
+
+            if (!player.isSeamlessSwitching() && player.getConnectedBackend() != null && player.getConnectedBackend() != backend) {
+                log.warn("{} rejected late outbound stream for backend {} while connected to {}",
+                        player.getIdentifier(),
+                        backend.getInfo().id(),
+                        player.getConnectedBackend().getInfo().id());
+                channel.close();
+                return;
+            }
+
             outboundConnection = new HytaleConnection(channel.parent(), proxy);
             outboundConnection.setPlayer(inboundConnection.getPlayer());
             if (player.isSeamlessSwitching()) {
@@ -43,11 +72,17 @@ public class OutboundChannelInitializer extends ChannelInitializer<QuicStreamCha
             } else {
                 outboundConnection.ensurePlayer().setOutboundConnection(outboundConnection);
             }
+        }
+
+        if (networkChannel == NetworkChannel.DEFAULT && outboundConnection.getPacketHandler() == null) {
             outboundConnection.setPacketHandler(new OutboundInitialPacketHandler(outboundConnection, backend));
         }
 
-        if (outboundConnection == null) {
-            throw new IllegalStateException("network channel %s initialized before DEFAULT".formatted(networkChannel == null ? "<unknown>" : networkChannel.toString()));
+        if (outboundConnection.getPacketHandler() == null && networkChannel != NetworkChannel.DEFAULT) {
+            log.debug("{} accepted backend {} {} stream before DEFAULT",
+                    player.getIdentifier(),
+                    backend.getInfo().id(),
+                    networkChannel == null ? "<unknown>" : networkChannel);
         }
 
         outboundConnection.setQuicStream(networkChannel, channel);

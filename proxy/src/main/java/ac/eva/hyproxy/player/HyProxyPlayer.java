@@ -9,14 +9,19 @@ import ac.eva.hyproxy.event.impl.player.PlayerSentToBackendEvent;
 import ac.eva.hyproxy.io.HytaleConnection;
 import ac.eva.hyproxy.io.handler.outbound.OutboundEmptyPacketHandler;
 import ac.eva.hyproxy.io.packet.Packet;
+import ac.eva.hyproxy.io.packet.impl.ClientDisconnect;
 import ac.eva.hyproxy.io.packet.impl.ClientReferral;
 import ac.eva.hyproxy.io.packet.impl.game.ServerMessage;
+import ac.eva.hyproxy.io.proto.ClientDisconnectReason;
 import ac.eva.hyproxy.io.proto.ClientType;
 import ac.eva.hyproxy.io.proto.DisconnectType;
 import ac.eva.hyproxy.io.proto.NetworkChannel;
 import ac.eva.hyproxy.message.Message;
 import ac.eva.hyproxy.player.permission.PlayerPermissionProvider;
 import com.google.common.collect.ImmutableSet;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.Setter;
@@ -24,16 +29,20 @@ import lombok.extern.slf4j.Slf4j;
 import org.jspecify.annotations.Nullable;
 
 import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.Deque;
 import java.time.Instant;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.UUID;
 
 @Slf4j
 @Getter
 @RequiredArgsConstructor
 public class HyProxyPlayer implements CommandSender {
+    private static final int MAX_TRACKED_BACKEND_ENTITY_IDS = 65536;
+
     private final HyProxy proxy;
     private final HytaleConnection inboundConnection;
     @Setter
@@ -68,9 +77,19 @@ public class HyProxyPlayer implements CommandSender {
     private @Nullable HyProxyBackend pendingSeamlessBackend;
     private boolean seamlessSwitching = false;
     private boolean suppressNextJoinWorld = false;
+    private boolean pendingSeamlessGameplayReady = false;
+    private long seamlessHandoffSequence = 0;
+    @Setter
+    private int currentClientEntityId = -1;
+    private final Set<Integer> trackedBackendEntityIds = new HashSet<>();
+    private @Nullable SeamlessTransferCorrection pendingSeamlessCorrection;
+    private byte @Nullable [] latestViewRadiusPacket;
+    private byte @Nullable [] latestPlayerOptionsPacket;
     private final Deque<Integer> rawPongIds = new ArrayDeque<>();
     private final Deque<Integer> directPongIds = new ArrayDeque<>();
     private final Deque<Integer> tickPongIds = new ArrayDeque<>();
+    private final Deque<Byte> syntheticTeleportAckIds = new ArrayDeque<>();
+    private byte nextSyntheticTeleportId = Byte.MIN_VALUE;
 
     /**
      * sends a player to another backend. this will send the client a referral with special referral data
@@ -79,6 +98,10 @@ public class HyProxyPlayer implements CommandSender {
      * @param backend the new backend
      */
     public void sendPlayerToBackend(HyProxyBackend backend) {
+        this.sendPlayerToBackend(backend, null);
+    }
+
+    public void sendPlayerToBackend(HyProxyBackend backend, @Nullable SeamlessTransferCorrection correction) {
         if (!this.seamlessSwitching && this.connectedBackend == backend) {
             log.info("{} is already connected to backend {}, ignoring switch request", this.getIdentifier(), backend.getInfo().id());
             return;
@@ -109,6 +132,8 @@ public class HyProxyPlayer implements CommandSender {
         log.info("{} is connecting to backend {}", this.getIdentifier(), newBackend.getInfo().id());
 
         if (!this.hasActiveOutboundConnection()) {
+            this.pendingSeamlessCorrection = null;
+            this.pendingSeamlessGameplayReady = false;
             this.sendPlayerToBackendWithReferral(newBackend);
             return;
         }
@@ -116,24 +141,35 @@ public class HyProxyPlayer implements CommandSender {
         HytaleConnection oldOutboundConnection = this.outboundConnection;
         this.seamlessSwitching = true;
         this.suppressNextJoinWorld = true;
+        long handoffSequence = ++this.seamlessHandoffSequence;
         this.pendingOutboundConnection = null;
         this.pendingSeamlessBackend = newBackend;
+        this.pendingSeamlessCorrection = correction;
+        this.pendingSeamlessGameplayReady = false;
         log.info("{} is starting seamless backend handoff to {}", this.getIdentifier(), newBackend.getInfo().id());
 
         BackendConnector.connect(this.inboundConnection, newBackend, cause -> {
-            if (!this.seamlessSwitching || this.connectedBackend == newBackend || this.pendingSeamlessBackend != newBackend) {
+            if (this.seamlessHandoffSequence != handoffSequence
+                    || !this.seamlessSwitching
+                    || this.connectedBackend == newBackend
+                    || this.pendingSeamlessBackend != newBackend) {
                 log.warn("{} got a late seamless handoff failure for {}, ignoring it", this.getIdentifier(), newBackend.getInfo().id(), cause);
                 return;
             }
 
-            log.warn("{} failed seamless backend handoff to {}, falling back to referral", this.getIdentifier(), newBackend.getInfo().id(), cause);
-            this.seamlessSwitching = false;
-            this.suppressNextJoinWorld = false;
-            this.pendingOutboundConnection = null;
-            this.pendingSeamlessBackend = null;
-            this.outboundConnection = oldOutboundConnection;
-            this.sendPlayerToBackendWithReferral(newBackend);
+            this.abortPendingSeamlessHandoff(newBackend, oldOutboundConnection, "connection failure", cause);
         });
+
+        this.inboundConnection.getChannel().eventLoop().schedule(() -> {
+            if (this.seamlessHandoffSequence != handoffSequence
+                    || !this.seamlessSwitching
+                    || this.connectedBackend == newBackend
+                    || this.pendingSeamlessBackend != newBackend) {
+                return;
+            }
+
+            this.abortPendingSeamlessHandoff(newBackend, oldOutboundConnection, "setup timeout", null);
+        }, 8, TimeUnit.SECONDS);
     }
 
     private void sendPlayerToBackendWithReferral(HyProxyBackend newBackend) {
@@ -239,9 +275,7 @@ public class HyProxyPlayer implements CommandSender {
         }
 
         if (oldOutboundConnection != null && oldOutboundConnection != pendingConnection) {
-            oldOutboundConnection.setPacketHandler(new OutboundEmptyPacketHandler());
-            oldOutboundConnection.setPlayer(null);
-            oldOutboundConnection.close();
+            this.closeReplacedOutboundConnection(oldOutboundConnection);
         }
     }
 
@@ -257,6 +291,127 @@ public class HyProxyPlayer implements CommandSender {
         this.pendingSeamlessBackend = null;
         this.seamlessSwitching = false;
         this.suppressNextJoinWorld = false;
+        this.pendingSeamlessCorrection = null;
+        this.pendingSeamlessGameplayReady = false;
+    }
+
+    public void abortPendingSeamlessHandoff(
+            HyProxyBackend backend,
+            HytaleConnection oldOutboundConnection,
+            String reason,
+            @Nullable Throwable cause
+    ) {
+        if (!this.seamlessSwitching || this.pendingSeamlessBackend != backend) {
+            return;
+        }
+
+        HytaleConnection pendingConnection = this.pendingOutboundConnection;
+        this.outboundConnection = oldOutboundConnection;
+        this.pendingOutboundConnection = null;
+        this.pendingSeamlessBackend = null;
+        this.seamlessSwitching = false;
+        this.suppressNextJoinWorld = false;
+        this.pendingSeamlessCorrection = null;
+        this.pendingSeamlessGameplayReady = false;
+
+        if (pendingConnection != null && pendingConnection != oldOutboundConnection) {
+            pendingConnection.setPacketHandler(new OutboundEmptyPacketHandler());
+            pendingConnection.setPlayer(null);
+            pendingConnection.closeApplication();
+        }
+
+        if (cause == null) {
+            log.warn("{} aborted seamless backend handoff to {} after {}", this.getIdentifier(), backend.getInfo().id(), reason);
+        } else {
+            log.warn("{} aborted seamless backend handoff to {} after {}", this.getIdentifier(), backend.getInfo().id(), reason, cause);
+        }
+    }
+
+    public synchronized void rememberLatestViewRadiusPacket(ByteBuf packet) {
+        this.latestViewRadiusPacket = copyReadableBytes(packet);
+    }
+
+    public synchronized void rememberLatestPlayerOptionsPacket(ByteBuf packet) {
+        this.latestPlayerOptionsPacket = copyReadableBytes(packet);
+        log.info("{} captured PlayerOptions packet for seamless handoff replay (skin={}, bytes={})",
+                this.getIdentifier(),
+                playerOptionsPacketHasSkin(packet),
+                packet.readableBytes());
+    }
+
+    public synchronized @Nullable ByteBuf copyLatestViewRadiusPacket() {
+        return this.latestViewRadiusPacket == null ? null : Unpooled.wrappedBuffer(Arrays.copyOf(this.latestViewRadiusPacket, this.latestViewRadiusPacket.length));
+    }
+
+    public synchronized @Nullable ByteBuf copyLatestPlayerOptionsPacket() {
+        return this.latestPlayerOptionsPacket == null ? null : Unpooled.wrappedBuffer(Arrays.copyOf(this.latestPlayerOptionsPacket, this.latestPlayerOptionsPacket.length));
+    }
+
+    public synchronized void rememberTrackedBackendEntityId(int entityId) {
+        if (this.trackedBackendEntityIds.size() >= MAX_TRACKED_BACKEND_ENTITY_IDS) {
+            return;
+        }
+
+        this.trackedBackendEntityIds.add(entityId);
+    }
+
+    public synchronized Set<Integer> trackedBackendEntityIdsForRemoval() {
+        Set<Integer> entityIds = new HashSet<>(this.trackedBackendEntityIds);
+        if (this.currentClientEntityId >= 0) {
+            entityIds.add(this.currentClientEntityId);
+        }
+
+        return entityIds;
+    }
+
+    public synchronized void clearTrackedBackendEntityIds() {
+        this.trackedBackendEntityIds.clear();
+    }
+
+    public synchronized @Nullable SeamlessTransferCorrection consumePendingSeamlessCorrection() {
+        SeamlessTransferCorrection correction = this.pendingSeamlessCorrection;
+        this.pendingSeamlessCorrection = null;
+        return correction;
+    }
+
+    public synchronized void queuePendingSeamlessGameplayReady() {
+        this.pendingSeamlessGameplayReady = true;
+    }
+
+    public synchronized boolean consumePendingSeamlessGameplayReady() {
+        if (!this.pendingSeamlessGameplayReady) {
+            return false;
+        }
+
+        this.pendingSeamlessGameplayReady = false;
+        return true;
+    }
+
+    public synchronized byte queueSyntheticTeleportAck() {
+        byte teleportId = this.nextSyntheticTeleportId++;
+        if (this.nextSyntheticTeleportId >= 0) {
+            this.nextSyntheticTeleportId = Byte.MIN_VALUE;
+        }
+
+        this.syntheticTeleportAckIds.addLast(teleportId);
+        while (this.syntheticTeleportAckIds.size() > 8) {
+            this.syntheticTeleportAckIds.removeFirst();
+        }
+        return teleportId;
+    }
+
+    public synchronized boolean consumeSyntheticTeleportAck(byte teleportId) {
+        return this.syntheticTeleportAckIds.remove(teleportId);
+    }
+
+    private static byte[] copyReadableBytes(ByteBuf buf) {
+        byte[] bytes = new byte[buf.readableBytes()];
+        buf.getBytes(buf.readerIndex(), bytes);
+        return bytes;
+    }
+
+    private static boolean playerOptionsPacketHasSkin(ByteBuf packet) {
+        return packet.readableBytes() >= 9 && (packet.getByte(packet.readerIndex() + 8) & 1) != 0;
     }
 
     public synchronized void recordForwardedBackendPing(int id) {
@@ -300,6 +455,22 @@ public class HyProxyPlayer implements CommandSender {
             case 2 -> this.tickPongIds;
             default -> null;
         };
+    }
+
+    private void closeReplacedOutboundConnection(HytaleConnection oldOutboundConnection) {
+        ChannelFuture future = oldOutboundConnection.send(new ClientDisconnect(
+                ClientDisconnectReason.PLAYER_LEAVE,
+                DisconnectType.DISCONNECT
+        ));
+
+        oldOutboundConnection.setPacketHandler(new OutboundEmptyPacketHandler());
+        oldOutboundConnection.setPlayer(null);
+
+        if (future != null) {
+            future.addListener(ignored -> oldOutboundConnection.closeApplication());
+        } else {
+            oldOutboundConnection.closeApplication();
+        }
     }
 
     public boolean isSeamlessSwitching() {
@@ -397,5 +568,15 @@ public class HyProxyPlayer implements CommandSender {
         }
 
         return false;
+    }
+
+    public record SeamlessTransferCorrection(
+            double x,
+            double y,
+            double z,
+            float yaw,
+            float pitch,
+            float roll
+    ) {
     }
 }

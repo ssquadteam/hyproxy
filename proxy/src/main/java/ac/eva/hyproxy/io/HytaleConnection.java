@@ -128,8 +128,13 @@ public class HytaleConnection extends ChannelInboundHandlerAdapter {
     }
 
     public void disconnect(String message, DisconnectType type) {
-        this.send(new ServerDisconnect(Message.raw(message).getFormatted(), type)).addListener(ProtocolUtil.CLOSE_ON_COMPLETE);
+        ChannelFuture future = this.send(new ServerDisconnect(Message.raw(message).getFormatted(), type));
         this.disconnected = true;
+        if (future != null) {
+            future.addListener(ProtocolUtil.CLOSE_ON_COMPLETE);
+        } else {
+            ProtocolUtil.closeConnection(this.channel);
+        }
         if (this.hasPlayer()) {
             log.info("{} got disconnected: {}", this.getIdentifier(), message);
         }
@@ -155,15 +160,19 @@ public class HytaleConnection extends ChannelInboundHandlerAdapter {
         return null;
     }
 
-    public ChannelFuture send(NetworkChannel channel, Packet packet) {
+    public @Nullable ChannelFuture send(NetworkChannel channel, Packet packet) {
         return this.write(channel, packet);
     }
 
-    public ChannelFuture send(Packet packet) {
+    public @Nullable ChannelFuture send(Packet packet) {
         return this.write(packet);
     }
 
     public void close() {
         ProtocolUtil.closeConnection(this.channel);
+    }
+
+    public void closeApplication() {
+        ProtocolUtil.closeApplicationConnection(this.channel);
     }
 }

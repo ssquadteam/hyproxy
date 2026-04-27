@@ -21,6 +21,9 @@ import java.util.Locale;
 @Slf4j
 public class InboundForwardingPacketHandler implements HytalePacketHandler {
     private static final int PONG_PACKET_ID = 4;
+    private static final int VIEW_RADIUS_PACKET_ID = 32;
+    private static final int PLAYER_OPTIONS_PACKET_ID = 33;
+    private static final int CLIENT_MOVEMENT_PACKET_ID = 108;
 
     private final HytaleConnection connection;
 
@@ -61,13 +64,28 @@ public class InboundForwardingPacketHandler implements HytalePacketHandler {
     @Override
     public void handleUnknown(NetworkChannel channel, ByteBuf buf) {
         HyProxyPlayer player = connection.ensurePlayer();
+        int packetId = packetId(buf);
+
+        if (channel == NetworkChannel.DEFAULT && packetId == VIEW_RADIUS_PACKET_ID) {
+            player.rememberLatestViewRadiusPacket(buf);
+        } else if (channel == NetworkChannel.DEFAULT && packetId == PLAYER_OPTIONS_PACKET_ID) {
+            player.rememberLatestPlayerOptionsPacket(buf);
+        }
 
         if (!player.hasActiveOutboundConnection()) return;
-        if (channel == NetworkChannel.DEFAULT && packetId(buf) == PONG_PACKET_ID) {
+        if (channel == NetworkChannel.DEFAULT && packetId == PONG_PACKET_ID) {
             int pongId = pongId(buf);
             int pongType = pongType(buf);
             if (!player.consumeForwardedBackendPong(pongId, pongType)) {
                 log.info("{} dropped stale Pong id {} type {}", player.getIdentifier(), pongId, pongType);
+                return;
+            }
+        }
+        if (channel == NetworkChannel.DEFAULT && packetId == CLIENT_MOVEMENT_PACKET_ID) {
+            int teleportAckId = teleportAckId(buf);
+            if (teleportAckId != Integer.MIN_VALUE && player.consumeSyntheticTeleportAck((byte) teleportAckId)) {
+                log.info("{} stripped synthetic seamless handoff TeleportAck id {}", player.getIdentifier(), teleportAckId);
+                player.getOutboundConnection().write(channel, stripTeleportAck(buf));
                 return;
             }
         }
@@ -105,5 +123,26 @@ public class InboundForwardingPacketHandler implements HytalePacketHandler {
         }
 
         return buf.getByte(buf.readerIndex() + 25);
+    }
+
+    private static int teleportAckId(ByteBuf buf) {
+        if (buf.readableBytes() < 88) {
+            return Integer.MIN_VALUE;
+        }
+
+        int payloadIndex = buf.readerIndex() + 8;
+        if ((buf.getByte(payloadIndex) & 0x20) == 0) {
+            return Integer.MIN_VALUE;
+        }
+
+        return buf.getByte(payloadIndex + 79);
+    }
+
+    private static ByteBuf stripTeleportAck(ByteBuf original) {
+        ByteBuf stripped = original.copy();
+        int payloadIndex = stripped.readerIndex() + 8;
+        stripped.setByte(payloadIndex, stripped.getByte(payloadIndex) & ~0x20);
+        stripped.setByte(payloadIndex + 79, 0);
+        return stripped;
     }
 }
