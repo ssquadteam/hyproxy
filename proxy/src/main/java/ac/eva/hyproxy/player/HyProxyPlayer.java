@@ -23,6 +23,8 @@ import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.jspecify.annotations.Nullable;
 
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.time.Instant;
 import java.util.HashSet;
 import java.util.Set;
@@ -66,6 +68,9 @@ public class HyProxyPlayer implements CommandSender {
     private @Nullable HyProxyBackend pendingSeamlessBackend;
     private boolean seamlessSwitching = false;
     private boolean suppressNextJoinWorld = false;
+    private final Deque<Integer> rawPongIds = new ArrayDeque<>();
+    private final Deque<Integer> directPongIds = new ArrayDeque<>();
+    private final Deque<Integer> tickPongIds = new ArrayDeque<>();
 
     /**
      * sends a player to another backend. this will send the client a referral with special referral data
@@ -225,6 +230,7 @@ public class HyProxyPlayer implements CommandSender {
         this.pendingOutboundConnection = null;
         this.pendingSeamlessBackend = null;
         this.connectedBackend = backend;
+        this.clearForwardedBackendPings();
         this.connectedBackend.registerPlayer(this);
         this.referredBackend = null;
 
@@ -251,6 +257,49 @@ public class HyProxyPlayer implements CommandSender {
         this.pendingSeamlessBackend = null;
         this.seamlessSwitching = false;
         this.suppressNextJoinWorld = false;
+    }
+
+    public synchronized void recordForwardedBackendPing(int id) {
+        this.enqueuePongId(this.rawPongIds, id);
+        this.enqueuePongId(this.directPongIds, id);
+        this.enqueuePongId(this.tickPongIds, id);
+    }
+
+    public synchronized boolean consumeForwardedBackendPong(int id, int type) {
+        Deque<Integer> pongIds = this.pongIdsForType(type);
+        if (pongIds == null || pongIds.isEmpty()) {
+            return false;
+        }
+
+        Integer expectedId = pongIds.peekFirst();
+        if (expectedId == null || expectedId != id) {
+            return false;
+        }
+
+        pongIds.removeFirst();
+        return true;
+    }
+
+    private synchronized void clearForwardedBackendPings() {
+        this.rawPongIds.clear();
+        this.directPongIds.clear();
+        this.tickPongIds.clear();
+    }
+
+    private void enqueuePongId(Deque<Integer> pongIds, int id) {
+        pongIds.addLast(id);
+        while (pongIds.size() > 64) {
+            pongIds.removeFirst();
+        }
+    }
+
+    private @Nullable Deque<Integer> pongIdsForType(int type) {
+        return switch (type) {
+            case 0 -> this.rawPongIds;
+            case 1 -> this.directPongIds;
+            case 2 -> this.tickPongIds;
+            default -> null;
+        };
     }
 
     public boolean isSeamlessSwitching() {

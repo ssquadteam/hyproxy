@@ -20,6 +20,8 @@ import java.util.Locale;
 @RequiredArgsConstructor
 @Slf4j
 public class InboundForwardingPacketHandler implements HytalePacketHandler {
+    private static final int PONG_PACKET_ID = 4;
+
     private final HytaleConnection connection;
 
     @Override
@@ -61,6 +63,15 @@ public class InboundForwardingPacketHandler implements HytalePacketHandler {
         HyProxyPlayer player = connection.ensurePlayer();
 
         if (!player.hasActiveOutboundConnection()) return;
+        if (channel == NetworkChannel.DEFAULT && packetId(buf) == PONG_PACKET_ID) {
+            int pongId = pongId(buf);
+            int pongType = pongType(buf);
+            if (!player.consumeForwardedBackendPong(pongId, pongType)) {
+                log.info("{} dropped stale Pong id {} type {}", player.getIdentifier(), pongId, pongType);
+                return;
+            }
+        }
+
         player.getOutboundConnection().write(channel, buf.retain());
     }
 
@@ -70,5 +81,29 @@ public class InboundForwardingPacketHandler implements HytalePacketHandler {
 
         if (!player.hasActiveOutboundConnection()) return;
         ProtocolUtil.closeConnection(player.getOutboundConnection().getChannel());
+    }
+
+    private static int packetId(ByteBuf buf) {
+        if (buf.readableBytes() < 8) {
+            return -1;
+        }
+
+        return buf.getIntLE(buf.readerIndex() + 4);
+    }
+
+    private static int pongId(ByteBuf buf) {
+        if (buf.readableBytes() < 13) {
+            return Integer.MIN_VALUE;
+        }
+
+        return buf.getIntLE(buf.readerIndex() + 9);
+    }
+
+    private static int pongType(ByteBuf buf) {
+        if (buf.readableBytes() < 26) {
+            return -1;
+        }
+
+        return buf.getByte(buf.readerIndex() + 25);
     }
 }

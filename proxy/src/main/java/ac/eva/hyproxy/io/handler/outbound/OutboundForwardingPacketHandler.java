@@ -23,6 +23,7 @@ import com.github.luben.zstd.Zstd;
 @Slf4j
 @RequiredArgsConstructor
 public class OutboundForwardingPacketHandler implements HytalePacketHandler {
+    private static final int PING_PACKET_ID = 3;
     private static final int WORLD_SETTINGS_PACKET_ID = 20;
     private static final int WORLD_LOAD_FINISHED_PACKET_ID = 22;
     private static final int REQUEST_ASSETS_PACKET_ID = 23;
@@ -65,7 +66,13 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
         }
 
         if (!player.hasActiveInboundConnection()) return;
-        if (channel == NetworkChannel.DEFAULT && player.isSeamlessSwitching() && packetId(buf) == JOIN_WORLD_PACKET_ID) {
+
+        int packetId = packetId(buf);
+        if (channel == NetworkChannel.DEFAULT && packetId == PING_PACKET_ID) {
+            player.recordForwardedBackendPing(pingId(buf));
+        }
+
+        if (channel == NetworkChannel.DEFAULT && player.isSeamlessSwitching() && packetId == JOIN_WORLD_PACKET_ID) {
             log.info("{} forwarded no-fade JoinWorld during seamless backend handoff to {}", player.getIdentifier(), backend.getInfo().id());
             player.consumeSuppressNextJoinWorld();
             player.getInboundConnection().write(channel, sanitizedJoinWorld(buf));
@@ -189,6 +196,7 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
         }
 
         switch (packetId(buf)) {
+            case PING_PACKET_ID -> this.sendSyntheticPongs(pingId(buf));
             case WORLD_SETTINGS_PACKET_ID -> {
                 log.info("{} received target WorldSettings during seamless backend setup for {}", player.getIdentifier(), backend.getInfo().id());
                 this.sendViewRadius();
@@ -249,6 +257,24 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
         connection.write(NetworkChannel.DEFAULT, ready);
     }
 
+    private void sendSyntheticPongs(int id) {
+        connection.write(NetworkChannel.DEFAULT, syntheticPong(id, 0));
+        connection.write(NetworkChannel.DEFAULT, syntheticPong(id, 1));
+        connection.write(NetworkChannel.DEFAULT, syntheticPong(id, 2));
+    }
+
+    private static ByteBuf syntheticPong(int id, int type) {
+        ByteBuf pong = Unpooled.buffer(28);
+        pong.writeIntLE(20);
+        pong.writeIntLE(4);
+        pong.writeByte(0);
+        pong.writeIntLE(id);
+        pong.writeZero(12);
+        pong.writeByte(type);
+        pong.writeShortLE(0);
+        return pong;
+    }
+
     private static ByteBuf sanitizedJoinWorld(ByteBuf original) {
         ByteBuf joinWorld = original.copy();
         if (joinWorld.readableBytes() >= 10) {
@@ -265,5 +291,13 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
         }
 
         return buf.getIntLE(buf.readerIndex() + 4);
+    }
+
+    private static int pingId(ByteBuf buf) {
+        if (buf.readableBytes() < 13) {
+            return Integer.MIN_VALUE;
+        }
+
+        return buf.getIntLE(buf.readerIndex() + 9);
     }
 }
