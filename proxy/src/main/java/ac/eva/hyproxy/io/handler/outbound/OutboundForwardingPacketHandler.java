@@ -24,6 +24,7 @@ import com.github.luben.zstd.Zstd;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 @Slf4j
 @RequiredArgsConstructor
@@ -44,15 +45,25 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
     private static final int MAX_TRACKED_ENTITY_UPDATES_PAYLOAD_SIZE = 16 * 1024 * 1024;
     private static final int SHARDTALE_HANDOFF_VERSION = 1;
     private static final int SHARDTALE_HANDOFF_PAYLOAD_BYTES = 26;
+    private static final long SEAMLESS_SETUP_KICK_DELAY_MILLIS = 300L;
 
     private final HytaleConnection connection;
     private final HyProxyBackend backend;
+    private boolean pendingSetupKickSent = false;
+    private boolean pendingWorldSettingsReceived = false;
 
     @Override
     public void activated() {
         HyProxyPlayer player = connection.ensurePlayer();
         if (player.getPendingOutboundConnection() == connection) {
             log.info("{} started seamless backend setup with {}", player.getIdentifier(), backend.getInfo().id());
+            player.markSeamlessHandoffStage(
+                    backend,
+                    connection,
+                    HyProxyPlayer.SEAMLESS_STAGE_FORWARDING,
+                    "forwarding"
+            );
+            this.scheduleSeamlessSetupKick(player);
             return;
         }
 
@@ -244,15 +255,33 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
         switch (packetId(buf)) {
             case PING_PACKET_ID -> this.sendSyntheticPongs(pingId(buf));
             case WORLD_SETTINGS_PACKET_ID -> {
+                this.pendingWorldSettingsReceived = true;
+                player.markSeamlessHandoffStage(
+                        backend,
+                        connection,
+                        HyProxyPlayer.SEAMLESS_STAGE_WORLD_SETTINGS,
+                        "WorldSettings"
+                );
                 log.info("{} received target WorldSettings during seamless backend setup for {}", player.getIdentifier(), backend.getInfo().id());
-                this.sendViewRadius();
-                this.sendRequestAssets();
+                this.sendSeamlessSetupKick();
             }
             case WORLD_LOAD_FINISHED_PACKET_ID -> {
+                player.markSeamlessHandoffStage(
+                        backend,
+                        connection,
+                        HyProxyPlayer.SEAMLESS_STAGE_WORLD_LOAD_FINISHED,
+                        "WorldLoadFinished"
+                );
                 log.info("{} received target WorldLoadFinished during seamless backend setup for {}", player.getIdentifier(), backend.getInfo().id());
                 this.sendPlayerOptions(player);
             }
             case JOIN_WORLD_PACKET_ID -> {
+                player.markSeamlessHandoffStage(
+                        backend,
+                        connection,
+                        HyProxyPlayer.SEAMLESS_STAGE_JOIN_WORLD,
+                        "JoinWorld"
+                );
                 if (player.getCurrentClientEntityId() < 0) {
                     log.warn("{} has no tracked client entity id, forwarding clear/no-fade JoinWorld and promoted seamless backend handoff to {}",
                             player.getIdentifier(),
@@ -282,6 +311,31 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
             default -> {
             }
         }
+    }
+
+    private void scheduleSeamlessSetupKick(HyProxyPlayer player) {
+        connection.getChannel().eventLoop().schedule(() -> {
+            if (!this.isPendingSeamlessHandoff(player)
+                    || this.pendingWorldSettingsReceived
+                    || this.pendingSetupKickSent) {
+                return;
+            }
+
+            log.warn("{} did not receive target WorldSettings quickly for {}; sending hidden setup kick",
+                    player.getIdentifier(),
+                    backend.getInfo().id());
+            this.sendSeamlessSetupKick();
+        }, SEAMLESS_SETUP_KICK_DELAY_MILLIS, TimeUnit.MILLISECONDS);
+    }
+
+    private void sendSeamlessSetupKick() {
+        if (this.pendingSetupKickSent) {
+            return;
+        }
+
+        this.pendingSetupKickSent = true;
+        this.sendViewRadius();
+        this.sendRequestAssets();
     }
 
     private void sendViewRadius() {

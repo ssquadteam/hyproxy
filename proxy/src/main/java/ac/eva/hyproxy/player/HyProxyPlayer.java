@@ -42,6 +42,14 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class HyProxyPlayer implements CommandSender {
     private static final int MAX_TRACKED_BACKEND_ENTITY_IDS = 65536;
+    public static final int SEAMLESS_STAGE_CONNECTING = 0;
+    public static final int SEAMLESS_STAGE_FORWARDING = 1;
+    public static final int SEAMLESS_STAGE_WORLD_SETTINGS = 2;
+    public static final int SEAMLESS_STAGE_WORLD_LOAD_FINISHED = 3;
+    public static final int SEAMLESS_STAGE_JOIN_WORLD = 4;
+    public static final int SEAMLESS_STAGE_PROMOTED = 5;
+    private static final long SEAMLESS_WORLD_SETTINGS_TIMEOUT_MILLIS = 1_200L;
+    private static final long SEAMLESS_JOIN_WORLD_TIMEOUT_MILLIS = 3_000L;
 
     private final HyProxy proxy;
     private final HytaleConnection inboundConnection;
@@ -79,6 +87,8 @@ public class HyProxyPlayer implements CommandSender {
     private boolean suppressNextJoinWorld = false;
     private boolean pendingSeamlessGameplayReady = false;
     private long seamlessHandoffSequence = 0;
+    private int seamlessHandoffStage = -1;
+    private String seamlessHandoffStageName = "idle";
     @Setter
     private int currentClientEntityId = -1;
     private final Set<Integer> trackedBackendEntityIds = new HashSet<>();
@@ -110,7 +120,8 @@ public class HyProxyPlayer implements CommandSender {
         if (this.seamlessSwitching) {
             String pendingBackendId = this.pendingSeamlessBackend != null ? this.pendingSeamlessBackend.getInfo().id() : "<unknown>";
             if (this.pendingSeamlessBackend == backend) {
-                log.info("{} already has a seamless backend handoff to {} in progress, ignoring duplicate switch request", this.getIdentifier(), pendingBackendId);
+                this.refreshPendingSeamlessCorrection(backend, correction);
+                log.debug("{} already has a seamless backend handoff to {} in progress, refreshed latest transfer state", this.getIdentifier(), pendingBackendId);
             } else {
                 log.warn("{} ignoring backend switch to {} while seamless handoff to {} is in progress", this.getIdentifier(), backend.getInfo().id(), pendingBackendId);
             }
@@ -146,6 +157,8 @@ public class HyProxyPlayer implements CommandSender {
         this.pendingSeamlessBackend = newBackend;
         this.pendingSeamlessCorrection = correction;
         this.pendingSeamlessGameplayReady = false;
+        this.seamlessHandoffStage = SEAMLESS_STAGE_CONNECTING;
+        this.seamlessHandoffStageName = "connecting";
         log.info("{} is starting seamless backend handoff to {}", this.getIdentifier(), newBackend.getInfo().id());
 
         BackendConnector.connect(this.inboundConnection, newBackend, cause -> {
@@ -160,6 +173,32 @@ public class HyProxyPlayer implements CommandSender {
             this.abortPendingSeamlessHandoff(newBackend, oldOutboundConnection, "connection failure", cause);
         });
 
+        this.scheduleSeamlessHandoffTimeout(
+                handoffSequence,
+                newBackend,
+                oldOutboundConnection,
+                SEAMLESS_STAGE_WORLD_SETTINGS,
+                "WorldSettings",
+                SEAMLESS_WORLD_SETTINGS_TIMEOUT_MILLIS
+        );
+        this.scheduleSeamlessHandoffTimeout(
+                handoffSequence,
+                newBackend,
+                oldOutboundConnection,
+                SEAMLESS_STAGE_JOIN_WORLD,
+                "JoinWorld",
+                SEAMLESS_JOIN_WORLD_TIMEOUT_MILLIS
+        );
+    }
+
+    private void scheduleSeamlessHandoffTimeout(
+            long handoffSequence,
+            HyProxyBackend newBackend,
+            HytaleConnection oldOutboundConnection,
+            int requiredStage,
+            String requiredStageName,
+            long timeoutMillis
+    ) {
         this.inboundConnection.getChannel().eventLoop().schedule(() -> {
             if (this.seamlessHandoffSequence != handoffSequence
                     || !this.seamlessSwitching
@@ -168,8 +207,21 @@ public class HyProxyPlayer implements CommandSender {
                 return;
             }
 
-            this.abortPendingSeamlessHandoff(newBackend, oldOutboundConnection, "setup timeout", null);
-        }, 8, TimeUnit.SECONDS);
+            String currentStageName;
+            synchronized (this) {
+                if (this.seamlessHandoffStage >= requiredStage) {
+                    return;
+                }
+                currentStageName = this.seamlessHandoffStageName;
+            }
+
+            this.abortPendingSeamlessHandoff(
+                    newBackend,
+                    oldOutboundConnection,
+                    "timed out waiting for " + requiredStageName + " (stage=" + currentStageName + ")",
+                    null
+            );
+        }, timeoutMillis, TimeUnit.MILLISECONDS);
     }
 
     private void sendPlayerToBackendWithReferral(HyProxyBackend newBackend) {
@@ -267,6 +319,8 @@ public class HyProxyPlayer implements CommandSender {
         this.pendingSeamlessBackend = null;
         this.connectedBackend = backend;
         this.clearForwardedBackendPings();
+        this.seamlessHandoffStage = SEAMLESS_STAGE_PROMOTED;
+        this.seamlessHandoffStageName = "promoted";
         this.connectedBackend.registerPlayer(this);
         this.referredBackend = null;
 
@@ -293,6 +347,8 @@ public class HyProxyPlayer implements CommandSender {
         this.suppressNextJoinWorld = false;
         this.pendingSeamlessCorrection = null;
         this.pendingSeamlessGameplayReady = false;
+        this.seamlessHandoffStage = -1;
+        this.seamlessHandoffStageName = "idle";
     }
 
     public void abortPendingSeamlessHandoff(
@@ -313,6 +369,8 @@ public class HyProxyPlayer implements CommandSender {
         this.suppressNextJoinWorld = false;
         this.pendingSeamlessCorrection = null;
         this.pendingSeamlessGameplayReady = false;
+        this.seamlessHandoffStage = -1;
+        this.seamlessHandoffStageName = "idle";
 
         if (pendingConnection != null && pendingConnection != oldOutboundConnection) {
             pendingConnection.setPacketHandler(new OutboundEmptyPacketHandler());
@@ -325,6 +383,31 @@ public class HyProxyPlayer implements CommandSender {
         } else {
             log.warn("{} aborted seamless backend handoff to {} after {}", this.getIdentifier(), backend.getInfo().id(), reason, cause);
         }
+    }
+
+    public synchronized void refreshPendingSeamlessCorrection(HyProxyBackend backend, @Nullable SeamlessTransferCorrection correction) {
+        if (!this.seamlessSwitching || this.pendingSeamlessBackend != backend || correction == null) {
+            return;
+        }
+
+        this.pendingSeamlessCorrection = correction;
+    }
+
+    public synchronized void markSeamlessHandoffStage(
+            HyProxyBackend backend,
+            HytaleConnection pendingConnection,
+            int stage,
+            String stageName
+    ) {
+        if (!this.seamlessSwitching
+                || this.pendingSeamlessBackend != backend
+                || this.pendingOutboundConnection != pendingConnection
+                || stage <= this.seamlessHandoffStage) {
+            return;
+        }
+
+        this.seamlessHandoffStage = stage;
+        this.seamlessHandoffStageName = stageName;
     }
 
     public synchronized void rememberLatestViewRadiusPacket(ByteBuf packet) {
