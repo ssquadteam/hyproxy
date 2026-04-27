@@ -3,6 +3,7 @@ package ac.eva.hyproxy.player;
 import ac.eva.hyproxy.HyProxy;
 import ac.eva.hyproxy.backend.HyProxyBackend;
 import ac.eva.hyproxy.command.CommandSender;
+import ac.eva.hyproxy.io.BackendConnector;
 import ac.eva.hyproxy.common.util.SecretMessageUtil;
 import ac.eva.hyproxy.event.impl.player.PlayerSentToBackendEvent;
 import ac.eva.hyproxy.io.HytaleConnection;
@@ -35,6 +36,8 @@ public class HyProxyPlayer implements CommandSender {
     private final HytaleConnection inboundConnection;
     @Setter
     private HytaleConnection outboundConnection;
+    @Setter
+    private @Nullable HytaleConnection pendingOutboundConnection;
 
     // player info
     @Setter
@@ -60,6 +63,9 @@ public class HyProxyPlayer implements CommandSender {
     private boolean authenticated = false;
 
     private @Nullable HyProxyBackend connectedBackend;
+    private @Nullable HyProxyBackend pendingSeamlessBackend;
+    private boolean seamlessSwitching = false;
+    private boolean suppressNextJoinWorld = false;
 
     /**
      * sends a player to another backend. this will send the client a referral with special referral data
@@ -68,6 +74,21 @@ public class HyProxyPlayer implements CommandSender {
      * @param backend the new backend
      */
     public void sendPlayerToBackend(HyProxyBackend backend) {
+        if (!this.seamlessSwitching && this.connectedBackend == backend) {
+            log.info("{} is already connected to backend {}, ignoring switch request", this.getIdentifier(), backend.getInfo().id());
+            return;
+        }
+
+        if (this.seamlessSwitching) {
+            String pendingBackendId = this.pendingSeamlessBackend != null ? this.pendingSeamlessBackend.getInfo().id() : "<unknown>";
+            if (this.pendingSeamlessBackend == backend) {
+                log.info("{} already has a seamless backend handoff to {} in progress, ignoring duplicate switch request", this.getIdentifier(), pendingBackendId);
+            } else {
+                log.warn("{} ignoring backend switch to {} while seamless handoff to {} is in progress", this.getIdentifier(), backend.getInfo().id(), pendingBackendId);
+            }
+            return;
+        }
+
         PlayerSentToBackendEvent event = this.proxy.getEventBus().fire(new PlayerSentToBackendEvent(
                 this,
                 this.connectedBackend,
@@ -82,17 +103,50 @@ public class HyProxyPlayer implements CommandSender {
         HyProxyBackend newBackend = event.getNewBackend();
         log.info("{} is connecting to backend {}", this.getIdentifier(), newBackend.getInfo().id());
 
+        if (!this.hasActiveOutboundConnection()) {
+            this.sendPlayerToBackendWithReferral(newBackend);
+            return;
+        }
+
+        HytaleConnection oldOutboundConnection = this.outboundConnection;
+        this.seamlessSwitching = true;
+        this.suppressNextJoinWorld = true;
+        this.pendingOutboundConnection = null;
+        this.pendingSeamlessBackend = newBackend;
+        log.info("{} is starting seamless backend handoff to {}", this.getIdentifier(), newBackend.getInfo().id());
+
+        BackendConnector.connect(this.inboundConnection, newBackend, cause -> {
+            if (!this.seamlessSwitching || this.connectedBackend == newBackend || this.pendingSeamlessBackend != newBackend) {
+                log.warn("{} got a late seamless handoff failure for {}, ignoring it", this.getIdentifier(), newBackend.getInfo().id(), cause);
+                return;
+            }
+
+            log.warn("{} failed seamless backend handoff to {}, falling back to referral", this.getIdentifier(), newBackend.getInfo().id(), cause);
+            this.seamlessSwitching = false;
+            this.suppressNextJoinWorld = false;
+            this.pendingOutboundConnection = null;
+            this.pendingSeamlessBackend = null;
+            this.outboundConnection = oldOutboundConnection;
+            this.sendPlayerToBackendWithReferral(newBackend);
+        });
+    }
+
+    private void sendPlayerToBackendWithReferral(HyProxyBackend newBackend) {
         byte[] referralData = SecretMessageUtil.generateReferralData(new SecretMessageUtil.BackendReferralMessage(
                 this.profileId,
                 newBackend.getInfo().id(),
                 Instant.now().getEpochSecond()
         ), proxy.getConfiguration().getProxySecret());
 
-        this.outboundConnection.setPacketHandler(new OutboundEmptyPacketHandler());
+        if (this.outboundConnection != null) {
+            this.outboundConnection.setPacketHandler(new OutboundEmptyPacketHandler());
+        }
 
         this.sendToPlayer(new ClientReferral(proxy.getConfiguration().getPublicIp(), referralData));
 
-        this.outboundConnection.disconnect("player sent to another backend");
+        if (this.outboundConnection != null) {
+            this.outboundConnection.disconnect("player sent to another backend");
+        }
     }
 
     public String getIdentifier() {
@@ -154,6 +208,64 @@ public class HyProxyPlayer implements CommandSender {
 
         // cleanup so we dont have a old backend instance laying around
         this.referredBackend = null;
+    }
+
+    /**
+     * internal: please don't call this!
+     */
+    public void promotePendingOutboundConnection(HytaleConnection pendingConnection, HyProxyBackend backend) {
+        if (this.pendingOutboundConnection != pendingConnection) {
+            throw new IllegalStateException("tried to promote an outbound connection that is not pending");
+        }
+
+        HytaleConnection oldOutboundConnection = this.outboundConnection;
+        HyProxyBackend oldBackend = this.connectedBackend;
+
+        this.outboundConnection = pendingConnection;
+        this.pendingOutboundConnection = null;
+        this.pendingSeamlessBackend = null;
+        this.connectedBackend = backend;
+        this.connectedBackend.registerPlayer(this);
+        this.referredBackend = null;
+
+        if (oldBackend != null) {
+            oldBackend.unregisterPlayer(this);
+        }
+
+        if (oldOutboundConnection != null && oldOutboundConnection != pendingConnection) {
+            oldOutboundConnection.setPacketHandler(new OutboundEmptyPacketHandler());
+            oldOutboundConnection.setPlayer(null);
+            oldOutboundConnection.close();
+        }
+    }
+
+    /**
+     * internal: please don't call this!
+     */
+    public void clearPendingSeamlessHandoff(HytaleConnection pendingConnection) {
+        if (this.pendingOutboundConnection != pendingConnection) {
+            return;
+        }
+
+        this.pendingOutboundConnection = null;
+        this.pendingSeamlessBackend = null;
+        this.seamlessSwitching = false;
+        this.suppressNextJoinWorld = false;
+    }
+
+    public boolean isSeamlessSwitching() {
+        return this.seamlessSwitching;
+    }
+
+    public boolean consumeSuppressNextJoinWorld() {
+        if (!this.suppressNextJoinWorld) {
+            return false;
+        }
+
+        this.suppressNextJoinWorld = false;
+        this.seamlessSwitching = false;
+        this.pendingSeamlessBackend = null;
+        return true;
     }
 
     /**

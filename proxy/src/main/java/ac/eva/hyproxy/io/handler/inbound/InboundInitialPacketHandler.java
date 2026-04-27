@@ -21,12 +21,8 @@ public class InboundInitialPacketHandler implements HytalePacketHandler {
 
     @Override
     public boolean handle(Connect connect) {
-        if (connection.getProxy().getPlayerByProfileId(connect.getUuid()) != null) {
-            connection.disconnect("You are already connected to this proxy!");
-            return true;
-        }
-
         HyProxyPlayer player = new HyProxyPlayer(connection.getProxy(), connection);
+        HyProxyBackend referredBackend = null;
 
         player.setProtocolCrc(connect.getProtocolCrc());
         player.setProtocolBuildNumber(connect.getProtocolBuildNumber());
@@ -57,7 +53,32 @@ public class InboundInitialPacketHandler implements HytalePacketHandler {
                 return true;
             }
 
-            player.setReferredBackend(backend);
+            referredBackend = backend;
+        }
+
+        HyProxyPlayer existingPlayer = connection.getProxy().getPlayerByProfileId(connect.getUuid(), true);
+        if (existingPlayer != null) {
+            if (referredBackend == null) {
+                connection.disconnect("You are already connected to this proxy!");
+                return true;
+            }
+
+            log.info(
+                    "replacing existing connection for {} during referral to backend {}",
+                    existingPlayer.getIdentifier(),
+                    referredBackend.getInfo().id()
+            );
+            existingPlayer.onDisconnect();
+            existingPlayer.getInboundConnection().setPlayer(null);
+            if (existingPlayer.getOutboundConnection() != null) {
+                existingPlayer.getOutboundConnection().setPlayer(null);
+                existingPlayer.getOutboundConnection().close();
+            }
+            existingPlayer.getInboundConnection().close();
+        }
+
+        if (referredBackend != null) {
+            player.setReferredBackend(referredBackend);
         }
 
         PlayerPreAuthConnectEvent event = connection.getProxy().getEventBus().fire(new PlayerPreAuthConnectEvent(

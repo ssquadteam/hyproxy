@@ -1,6 +1,7 @@
 package ac.eva.hyproxy.io.handler.outbound;
 
 import ac.eva.hyproxy.io.proto.NetworkChannel;
+import io.netty.buffer.Unpooled;
 import io.netty.buffer.ByteBuf;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -17,22 +18,39 @@ import ac.eva.hyproxy.io.packet.impl.setup.ServerInfo;
 import ac.eva.hyproxy.message.HyProxyColors;
 import ac.eva.hyproxy.message.Message;
 import ac.eva.hyproxy.player.HyProxyPlayer;
+import com.github.luben.zstd.Zstd;
 
 @Slf4j
 @RequiredArgsConstructor
 public class OutboundForwardingPacketHandler implements HytalePacketHandler {
+    private static final int WORLD_SETTINGS_PACKET_ID = 20;
+    private static final int WORLD_LOAD_FINISHED_PACKET_ID = 22;
+    private static final int REQUEST_ASSETS_PACKET_ID = 23;
+    private static final int VIEW_RADIUS_PACKET_ID = 32;
+    private static final int PLAYER_OPTIONS_PACKET_ID = 33;
+    private static final int JOIN_WORLD_PACKET_ID = 104;
+    private static final int CLIENT_READY_PACKET_ID = 105;
+    private static final int DEFAULT_VIEW_RADIUS = 192;
+
     private final HytaleConnection connection;
     private final HyProxyBackend backend;
 
     @Override
     public void activated() {
-        connection.ensurePlayer().setConnectedBackend(backend);
+        HyProxyPlayer player = connection.ensurePlayer();
+        if (player.getPendingOutboundConnection() == connection) {
+            log.info("{} started seamless backend setup with {}", player.getIdentifier(), backend.getInfo().id());
+            return;
+        }
+
+        player.setConnectedBackend(backend);
     }
 
     @Override
     public void handleGeneric(NetworkChannel channel, Packet packet) {
         HyProxyPlayer player = connection.ensurePlayer();
 
+        if (this.isPendingSeamlessHandoff(player)) return;
         if (!player.hasActiveInboundConnection()) return;
         player.sendToPlayer(channel, packet);
     }
@@ -41,7 +59,20 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
     public void handleUnknown(NetworkChannel channel, ByteBuf buf) {
         HyProxyPlayer player = connection.ensurePlayer();
 
+        if (this.isPendingSeamlessHandoff(player)) {
+            this.handlePendingSeamlessPacket(channel, buf, player);
+            return;
+        }
+
         if (!player.hasActiveInboundConnection()) return;
+        if (channel == NetworkChannel.DEFAULT && player.isSeamlessSwitching() && packetId(buf) == JOIN_WORLD_PACKET_ID) {
+            log.info("{} forwarded no-fade JoinWorld during seamless backend handoff to {}", player.getIdentifier(), backend.getInfo().id());
+            player.consumeSuppressNextJoinWorld();
+            player.getInboundConnection().write(channel, sanitizedJoinWorld(buf));
+            this.sendClientReadyForChunks();
+            return;
+        }
+
         player.getInboundConnection().write(channel, buf.retain());
     }
 
@@ -113,12 +144,17 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
 
     @Override
     public boolean handle(ServerInfo serverInfo) {
+        HyProxyPlayer player = connection.ensurePlayer();
+        if (this.isPendingSeamlessHandoff(player)) {
+            return true;
+        }
+
         String serverName = serverInfo.getServerName();
         if (serverName == null || serverName.endsWith(" (hyproxy)")) {
             return false;
         }
 
-        this.connection.ensurePlayer().sendToPlayer(new ServerInfo(
+        player.sendToPlayer(new ServerInfo(
                 serverName + " (hyproxy)",
                 serverInfo.getMotd(),
                 serverInfo.getFallbackServer(),
@@ -132,7 +168,102 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
     public void disconnected() {
         HyProxyPlayer player = connection.ensurePlayer();
 
+        if (player.getPendingOutboundConnection() == connection) {
+            log.warn("{} pending seamless backend handoff to {} disconnected", player.getIdentifier(), backend.getInfo().id());
+            player.clearPendingSeamlessHandoff(connection);
+            return;
+        }
+
+        if (player.getOutboundConnection() != connection) return;
         if (!player.hasActiveInboundConnection()) return;
         player.getInboundConnection().close();
+    }
+
+    private boolean isPendingSeamlessHandoff(HyProxyPlayer player) {
+        return player.isSeamlessSwitching() && player.getPendingOutboundConnection() == connection;
+    }
+
+    private void handlePendingSeamlessPacket(NetworkChannel channel, ByteBuf buf, HyProxyPlayer player) {
+        if (channel != NetworkChannel.DEFAULT) {
+            return;
+        }
+
+        switch (packetId(buf)) {
+            case WORLD_SETTINGS_PACKET_ID -> {
+                log.info("{} received target WorldSettings during seamless backend setup for {}", player.getIdentifier(), backend.getInfo().id());
+                this.sendViewRadius();
+                this.sendRequestAssets();
+            }
+            case WORLD_LOAD_FINISHED_PACKET_ID -> {
+                log.info("{} received target WorldLoadFinished during seamless backend setup for {}", player.getIdentifier(), backend.getInfo().id());
+                this.sendPlayerOptions();
+            }
+            case JOIN_WORLD_PACKET_ID -> {
+                log.info("{} forwarded no-fade JoinWorld and promoted seamless backend handoff to {}", player.getIdentifier(), backend.getInfo().id());
+                ByteBuf joinWorld = sanitizedJoinWorld(buf);
+                player.promotePendingOutboundConnection(connection, backend);
+                player.consumeSuppressNextJoinWorld();
+                if (player.hasActiveInboundConnection()) {
+                    player.getInboundConnection().write(channel, joinWorld);
+                } else {
+                    joinWorld.release();
+                }
+                this.sendClientReadyForChunks();
+            }
+            default -> {
+            }
+        }
+    }
+
+    private void sendViewRadius() {
+        ByteBuf viewRadius = Unpooled.buffer(12);
+        viewRadius.writeIntLE(4);
+        viewRadius.writeIntLE(VIEW_RADIUS_PACKET_ID);
+        viewRadius.writeIntLE(DEFAULT_VIEW_RADIUS);
+        connection.write(NetworkChannel.DEFAULT, viewRadius);
+    }
+
+    private void sendRequestAssets() {
+        byte[] compressedPayload = Zstd.compress(new byte[] { 1, 0 }, Zstd.defaultCompressionLevel());
+        ByteBuf requestAssets = Unpooled.buffer(8 + compressedPayload.length);
+        requestAssets.writeIntLE(compressedPayload.length);
+        requestAssets.writeIntLE(REQUEST_ASSETS_PACKET_ID);
+        requestAssets.writeBytes(compressedPayload);
+        connection.write(NetworkChannel.DEFAULT, requestAssets);
+    }
+
+    private void sendPlayerOptions() {
+        ByteBuf playerOptions = Unpooled.buffer(9);
+        playerOptions.writeIntLE(1);
+        playerOptions.writeIntLE(PLAYER_OPTIONS_PACKET_ID);
+        playerOptions.writeByte(0);
+        connection.write(NetworkChannel.DEFAULT, playerOptions);
+    }
+
+    private void sendClientReadyForChunks() {
+        ByteBuf ready = Unpooled.buffer(10);
+        ready.writeIntLE(2);
+        ready.writeIntLE(CLIENT_READY_PACKET_ID);
+        ready.writeByte(1);
+        ready.writeByte(0);
+        connection.write(NetworkChannel.DEFAULT, ready);
+    }
+
+    private static ByteBuf sanitizedJoinWorld(ByteBuf original) {
+        ByteBuf joinWorld = original.copy();
+        if (joinWorld.readableBytes() >= 10) {
+            int payloadIndex = joinWorld.readerIndex() + 8;
+            joinWorld.setByte(payloadIndex, 1); // clear stale chunks/entities before target backend packets arrive
+            joinWorld.setByte(payloadIndex + 1, 0); // avoid the fade while still allowing the client world reset
+        }
+        return joinWorld;
+    }
+
+    private static int packetId(ByteBuf buf) {
+        if (buf.readableBytes() < 8) {
+            return -1;
+        }
+
+        return buf.getIntLE(buf.readerIndex() + 4);
     }
 }

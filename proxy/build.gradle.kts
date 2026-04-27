@@ -20,6 +20,7 @@ dependencies {
     implementation(libs.jose.jwt)
     implementation(libs.tink)
     implementation(libs.guava)
+    implementation("com.github.luben:zstd-jni:1.5.7-4")
 
     compileOnly(libs.lombok)
     annotationProcessor(libs.lombok)

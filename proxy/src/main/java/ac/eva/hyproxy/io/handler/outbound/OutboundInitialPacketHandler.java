@@ -56,6 +56,12 @@ public class OutboundInitialPacketHandler implements HytalePacketHandler {
     public void disconnected() {
         HyProxyPlayer player = connection.ensurePlayer();
 
+        if (player.getPendingOutboundConnection() == connection) {
+            player.clearPendingSeamlessHandoff(connection);
+            return;
+        }
+
+        if (player.getOutboundConnection() != connection) return;
         if (!player.hasActiveInboundConnection()) return;
         player.getInboundConnection().close();
     }

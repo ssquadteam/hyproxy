@@ -7,6 +7,7 @@ import ac.eva.hyproxy.io.PacketDecoder;
 import ac.eva.hyproxy.io.PacketEncoder;
 import ac.eva.hyproxy.io.handler.outbound.OutboundInitialPacketHandler;
 import ac.eva.hyproxy.io.proto.NetworkChannel;
+import ac.eva.hyproxy.player.HyProxyPlayer;
 import io.netty.channel.ChannelInitializer;
 import io.netty.handler.codec.quic.QuicStreamChannel;
 import lombok.RequiredArgsConstructor;
@@ -28,11 +29,20 @@ public class OutboundChannelInitializer extends ChannelInitializer<QuicStreamCha
         channel.pipeline().addLast("decoder", new PacketDecoder());
         channel.pipeline().addLast("encoder", new PacketEncoder());
 
-        HytaleConnection outboundConnection = inboundConnection.ensurePlayer().getOutboundConnection();
+        HyProxyPlayer player = inboundConnection.ensurePlayer();
+        HytaleConnection outboundConnection = player.getPendingOutboundConnection();
+        if (outboundConnection == null && (!player.isSeamlessSwitching() || player.getConnectedBackend() == backend)) {
+            outboundConnection = player.getOutboundConnection();
+        }
+
         if (outboundConnection == null && networkChannel == NetworkChannel.DEFAULT) {
             outboundConnection = new HytaleConnection(channel.parent(), proxy);
             outboundConnection.setPlayer(inboundConnection.getPlayer());
-            outboundConnection.ensurePlayer().setOutboundConnection(outboundConnection);
+            if (player.isSeamlessSwitching()) {
+                outboundConnection.ensurePlayer().setPendingOutboundConnection(outboundConnection);
+            } else {
+                outboundConnection.ensurePlayer().setOutboundConnection(outboundConnection);
+            }
             outboundConnection.setPacketHandler(new OutboundInitialPacketHandler(outboundConnection, backend));
         }
 
