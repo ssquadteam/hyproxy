@@ -38,17 +38,19 @@ public class OutboundChannelInitializer extends ChannelInitializer<QuicStreamCha
 
         HyProxyPlayer player = inboundConnection.ensurePlayer();
         HytaleConnection outboundConnection = null;
-        if (player.isSeamlessSwitching() && player.getPendingSeamlessBackend() == backend) {
+        boolean pendingSeamlessSetup = player.isPendingSeamlessSetupFor(backend);
+        if (pendingSeamlessSetup) {
             outboundConnection = player.getPendingOutboundConnection();
         } else if (!player.isSeamlessSwitching()
+                && !player.isSeamlessPrewarming()
                 && (player.getConnectedBackend() == null || player.getConnectedBackend() == backend)) {
             outboundConnection = player.getOutboundConnection();
         }
 
         if (outboundConnection == null) {
-            if (player.isSeamlessSwitching() && player.getPendingSeamlessBackend() != backend) {
+            if ((player.isSeamlessSwitching() || player.isSeamlessPrewarming()) && player.getPendingSeamlessBackend() != backend) {
                 String pendingBackendId = player.getPendingSeamlessBackend() == null ? "<unknown>" : player.getPendingSeamlessBackend().getInfo().id();
-                log.warn("{} rejected late outbound stream for backend {} while seamless handoff to {} is pending",
+                log.warn("{} rejected late outbound stream for backend {} while seamless setup to {} is pending",
                         player.getIdentifier(),
                         backend.getInfo().id(),
                         pendingBackendId);
@@ -56,7 +58,10 @@ public class OutboundChannelInitializer extends ChannelInitializer<QuicStreamCha
                 return;
             }
 
-            if (!player.isSeamlessSwitching() && player.getConnectedBackend() != null && player.getConnectedBackend() != backend) {
+            if (!player.isSeamlessSwitching()
+                    && !player.isSeamlessPrewarming()
+                    && player.getConnectedBackend() != null
+                    && player.getConnectedBackend() != backend) {
                 log.warn("{} rejected late outbound stream for backend {} while connected to {}",
                         player.getIdentifier(),
                         backend.getInfo().id(),
@@ -67,7 +72,7 @@ public class OutboundChannelInitializer extends ChannelInitializer<QuicStreamCha
 
             outboundConnection = new HytaleConnection(channel.parent(), proxy);
             outboundConnection.setPlayer(inboundConnection.getPlayer());
-            if (player.isSeamlessSwitching()) {
+            if (pendingSeamlessSetup) {
                 outboundConnection.ensurePlayer().setPendingOutboundConnection(outboundConnection);
             } else {
                 outboundConnection.ensurePlayer().setOutboundConnection(outboundConnection);
@@ -87,7 +92,7 @@ public class OutboundChannelInitializer extends ChannelInitializer<QuicStreamCha
 
         outboundConnection.setQuicStream(networkChannel, channel);
 
-        if (networkChannel != NetworkChannel.DEFAULT) {
+        if (networkChannel != NetworkChannel.DEFAULT && !pendingSeamlessSetup) {
             this.inboundConnection.getChannel().createStream(channel.type(), new InboundChannelInitializer(proxy));
         }
 

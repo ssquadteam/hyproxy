@@ -41,27 +41,37 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
     private static final int JOIN_WORLD_PACKET_ID = 104;
     private static final int CLIENT_READY_PACKET_ID = 105;
     private static final int CLIENT_TELEPORT_PACKET_ID = 109;
+    private static final int SET_CHUNK_PACKET_ID = 131;
+    private static final int SET_CHUNK_HEIGHTMAP_PACKET_ID = 132;
+    private static final int SET_CHUNK_TINTMAP_PACKET_ID = 133;
+    private static final int SET_CHUNK_ENVIRONMENTS_PACKET_ID = 134;
+    private static final int UNLOAD_CHUNK_PACKET_ID = 135;
     private static final int ENTITY_UPDATES_PACKET_ID = 161;
-    private static final int COMPONENT_UPDATE_TYPE_EQUIPMENT = 7;
-    private static final int COMPONENT_UPDATE_TYPE_ENTITY_STATS = 8;
     private static final int DEFAULT_VIEW_RADIUS = 192;
     private static final int SHARD_ENTITY_ID_RANGE_SIZE = 1_000_000;
     private static final int MAX_TRACKED_ENTITY_UPDATES_PAYLOAD_SIZE = 16 * 1024 * 1024;
     private static final int MAX_PROTOCOL_ARRAY_COUNT = 4_096_000;
     private static final int SHARDTALE_HANDOFF_VERSION = 1;
     private static final int SHARDTALE_HANDOFF_PAYLOAD_BYTES = 26;
+    private static final int SHARDTALE_PREWARM_PAYLOAD_BYTES = 27;
+    private static final int SHARDTALE_PREWARM_MODE = 1;
+    private static final boolean SEAMLESS_PREWARM_ENABLED = false;
     private static final long SEAMLESS_SETUP_KICK_DELAY_MILLIS = 300L;
 
     private final HytaleConnection connection;
     private final HyProxyBackend backend;
     private boolean pendingSetupKickSent = false;
     private boolean pendingWorldSettingsReceived = false;
+    private boolean pendingPrewarmChunkForwardLogged = false;
 
     @Override
     public void activated() {
         HyProxyPlayer player = connection.ensurePlayer();
         if (player.getPendingOutboundConnection() == connection) {
-            log.info("{} started seamless backend setup with {}", player.getIdentifier(), backend.getInfo().id());
+            log.info("{} started seamless backend {} with {}",
+                    player.getIdentifier(),
+                    player.isSeamlessPrewarming() ? "prewarm" : "setup",
+                    backend.getInfo().id());
             player.markSeamlessHandoffStage(
                     backend,
                     connection,
@@ -107,12 +117,8 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
                 player.setCurrentClientEntityId(clientEntityId);
             }
         }
-        EntityUpdatesForwardingDecision entityUpdatesForwardingDecision = EntityUpdatesForwardingDecision.forwardOriginal();
         if (channel == NetworkChannel.DEFAULT && packetId == ENTITY_UPDATES_PACKET_ID) {
-            entityUpdatesForwardingDecision = this.handleEntityUpdates(player, buf);
-            if (entityUpdatesForwardingDecision.drop()) {
-                return;
-            }
+            this.trackBackendEntityIdsFromEntityUpdates(player, buf);
         }
 
         if (channel == NetworkChannel.DEFAULT && player.isSeamlessSwitching() && packetId == JOIN_WORLD_PACKET_ID) {
@@ -139,11 +145,7 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
             return;
         }
 
-        if (entityUpdatesForwardingDecision.replacement() != null) {
-            player.getInboundConnection().write(channel, entityUpdatesForwardingDecision.replacement());
-        } else {
-            player.getInboundConnection().write(channel, buf.retain());
-        }
+        player.getInboundConnection().write(channel, buf.retain());
         if (channel == NetworkChannel.DEFAULT && packetId == SET_CLIENT_ID_PACKET_ID) {
             this.finishSeamlessClientActivation(player);
         }
@@ -156,6 +158,7 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
     @Override
     public boolean handle(AuthGrant passwordResponse) {
         HyProxy proxy = connection.getProxy();
+        HyProxyPlayer player = connection.ensurePlayer();
 
         if (!proxy.getConfiguration().isProxyCommunicationEnabled()) return false;
         if (passwordResponse.getServerIdentityToken() == null) return false;
@@ -163,6 +166,10 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
         ProxyCommunicationMessage message = ProxyCommunicationUtil.deserializeMessage(passwordResponse.getServerIdentityToken());
 
         if (message == null) return false;
+        if (this.isPendingSeamlessHandoff(player)) {
+            log.debug("{} suppressed proxy communication from hidden backend {}", player.getIdentifier(), backend.getInfo().id());
+            return true;
+        }
 
         // todo: move this somewhere else
         switch (message) {
@@ -246,7 +253,7 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
         HyProxyPlayer player = connection.ensurePlayer();
 
         if (player.getPendingOutboundConnection() == connection) {
-            log.warn("{} pending seamless backend handoff to {} disconnected", player.getIdentifier(), backend.getInfo().id());
+            log.warn("{} pending seamless backend setup to {} disconnected", player.getIdentifier(), backend.getInfo().id());
             player.clearPendingSeamlessHandoff(connection);
             return;
         }
@@ -257,15 +264,37 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
     }
 
     private boolean isPendingSeamlessHandoff(HyProxyPlayer player) {
-        return player.isSeamlessSwitching() && player.getPendingOutboundConnection() == connection;
+        return (player.isSeamlessSwitching() || player.isSeamlessPrewarming()) && player.getPendingOutboundConnection() == connection;
     }
 
     private void handlePendingSeamlessPacket(NetworkChannel channel, ByteBuf buf, HyProxyPlayer player) {
+        int packetId = packetId(buf);
+        if (channel == NetworkChannel.CHUNKS) {
+            if (SEAMLESS_PREWARM_ENABLED && player.isSeamlessPrewarming() && player.isSeamlessPrewarmReady() && isPrewarmChunkPacket(packetId)) {
+                if (player.hasActiveInboundConnection()) {
+                    if (!this.pendingPrewarmChunkForwardLogged) {
+                        this.pendingPrewarmChunkForwardLogged = true;
+                        log.info("{} started forwarding target chunk packets from prewarmed backend {}",
+                                player.getIdentifier(),
+                                backend.getInfo().id());
+                    }
+                    player.getInboundConnection().write(channel, buf.retain());
+                }
+                return;
+            }
+
+            if (packetId == UNLOAD_CHUNK_PACKET_ID) {
+                return;
+            }
+
+            return;
+        }
+
         if (channel != NetworkChannel.DEFAULT) {
             return;
         }
 
-        switch (packetId(buf)) {
+        switch (packetId) {
             case PING_PACKET_ID -> this.sendSyntheticPongs(pingId(buf));
             case WORLD_SETTINGS_PACKET_ID -> {
                 this.pendingWorldSettingsReceived = true;
@@ -288,6 +317,11 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
                 log.info("{} received target WorldLoadFinished during seamless backend setup for {}", player.getIdentifier(), backend.getInfo().id());
                 this.sendPlayerOptions(player);
             }
+            case SET_CLIENT_ID_PACKET_ID -> {
+                if (player.isSeamlessPrewarming()) {
+                    player.rememberPendingSeamlessSetClientId(buf, clientEntityId(buf));
+                }
+            }
             case JOIN_WORLD_PACKET_ID -> {
                 player.markSeamlessHandoffStage(
                         backend,
@@ -295,6 +329,15 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
                         HyProxyPlayer.SEAMLESS_STAGE_JOIN_WORLD,
                         "JoinWorld"
                 );
+                if (player.isSeamlessPrewarming()) {
+                    player.markSeamlessPrewarmReady(backend, connection);
+                    log.info("{} suppressed JoinWorld and started seamless chunk prewarm from {}",
+                            player.getIdentifier(),
+                            backend.getInfo().id());
+                    this.sendClientReadyForChunks();
+                    return;
+                }
+
                 if (player.getCurrentClientEntityId() < 0) {
                     log.warn("{} has no tracked client entity id, forwarding clear/no-fade JoinWorld and promoted seamless backend handoff to {}",
                             player.getIdentifier(),
@@ -395,21 +438,20 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
     }
 
     private void sendClientReadyForChunks() {
-        ByteBuf ready = Unpooled.buffer(10);
-        ready.writeIntLE(2);
-        ready.writeIntLE(CLIENT_READY_PACKET_ID);
-        ready.writeByte(1);
-        ready.writeByte(0);
-        connection.write(NetworkChannel.DEFAULT, ready);
+        connection.write(NetworkChannel.DEFAULT, clientReadyPacket(true, false));
     }
 
     private void sendClientReadyForGameplay() {
+        connection.write(NetworkChannel.DEFAULT, clientReadyPacket(false, true));
+    }
+
+    private static ByteBuf clientReadyPacket(boolean chunksReady, boolean gameplayReady) {
         ByteBuf ready = Unpooled.buffer(10);
         ready.writeIntLE(2);
         ready.writeIntLE(CLIENT_READY_PACKET_ID);
-        ready.writeByte(0);
-        ready.writeByte(1);
-        connection.write(NetworkChannel.DEFAULT, ready);
+        ready.writeByte(chunksReady ? 1 : 0);
+        ready.writeByte(gameplayReady ? 1 : 0);
+        return ready;
     }
 
     private void sendStaleEntityRemoval(HyProxyPlayer player, Set<Integer> staleEntityIds) {
@@ -449,19 +491,18 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
         player.getInboundConnection().write(NetworkChannel.DEFAULT, clientTeleportPacket(teleportId, correction));
     }
 
-    private EntityUpdatesForwardingDecision handleEntityUpdates(HyProxyPlayer player, ByteBuf packet) {
+    private void trackBackendEntityIdsFromEntityUpdates(HyProxyPlayer player, ByteBuf packet) {
         byte[] compressedPayload = compressedPayload(packet);
         if (compressedPayload == null) {
-            return EntityUpdatesForwardingDecision.forwardOriginal();
+            return;
         }
 
         byte[] payload = decompressEntityUpdatesPayload(compressedPayload);
         if (payload == null) {
-            return EntityUpdatesForwardingDecision.forwardOriginal();
+            return;
         }
 
         this.trackPotentialBackendEntityIds(player, payload);
-        return this.dedupeLocalPlayerStateResync(player, payload);
     }
 
     private void trackPotentialBackendEntityIds(HyProxyPlayer player, byte[] payload) {
@@ -479,80 +520,11 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
         }
     }
 
-    private EntityUpdatesForwardingDecision dedupeLocalPlayerStateResync(HyProxyPlayer player, byte[] payload) {
-        int localEntityId = player.getCurrentClientEntityId();
-        if (localEntityId < 0) {
-            return EntityUpdatesForwardingDecision.forwardOriginal();
-        }
-
-        ParsedEntityUpdates parsedPayload = parseEntityUpdatesPayload(payload);
-        if (parsedPayload == null || parsedPayload.updates() == null || parsedPayload.updates().isEmpty()) {
-            return EntityUpdatesForwardingDecision.forwardOriginal();
-        }
-
-        List<byte[]> serializedUpdates = new ArrayList<>(parsedPayload.updates().size());
-        int droppedComponents = 0;
-        int droppedEntityUpdates = 0;
-
-        for (ParsedEntityUpdate entityUpdate : parsedPayload.updates()) {
-            if (entityUpdate.networkId() != localEntityId || entityUpdate.updates() == null || entityUpdate.updates().isEmpty()) {
-                serializedUpdates.add(entityUpdate.originalBytes());
-                continue;
-            }
-
-            List<ParsedComponentUpdate> keptComponents = new ArrayList<>(entityUpdate.updates().size());
-            int entityDroppedComponents = 0;
-            for (ParsedComponentUpdate componentUpdate : entityUpdate.updates()) {
-                if (isDedupeComponentType(componentUpdate.typeId())
-                        && player.processLocalPlayerComponentUpdateForSeamlessDedupe(componentUpdate.typeId(), componentUpdate.bytes())) {
-                    entityDroppedComponents++;
-                    continue;
-                }
-
-                keptComponents.add(componentUpdate);
-            }
-
-            if (entityDroppedComponents == 0) {
-                serializedUpdates.add(entityUpdate.originalBytes());
-                continue;
-            }
-
-            droppedComponents += entityDroppedComponents;
-            byte[] serializedEntityUpdate = serializeEntityUpdate(
-                    entityUpdate.networkId(),
-                    entityUpdate.removedBytes(),
-                    keptComponents
-            );
-            if (serializedEntityUpdate == null) {
-                droppedEntityUpdates++;
-            } else {
-                serializedUpdates.add(serializedEntityUpdate);
-            }
-        }
-
-        if (droppedComponents == 0) {
-            return EntityUpdatesForwardingDecision.forwardOriginal();
-        }
-
-        byte[] rewrittenPayload = serializeEntityUpdatesPayload(parsedPayload.removedBytes(), serializedUpdates);
-        if (rewrittenPayload == null) {
-            log.info("{} skipped {} unchanged local-player equipment/stats component update(s) in {} entity update(s) from backend {} during seamless handoff",
-                    player.getIdentifier(),
-                    droppedComponents,
-                    droppedEntityUpdates,
-                    backend.getInfo().id());
-            return EntityUpdatesForwardingDecision.dropPacket();
-        }
-
-        log.info("{} skipped {} unchanged local-player equipment/stats component update(s) from backend {} during seamless handoff",
-                player.getIdentifier(),
-                droppedComponents,
-                backend.getInfo().id());
-        return EntityUpdatesForwardingDecision.replace(entityUpdatesPacket(rewrittenPayload));
-    }
-
-    private static boolean isDedupeComponentType(int componentType) {
-        return componentType == COMPONENT_UPDATE_TYPE_EQUIPMENT || componentType == COMPONENT_UPDATE_TYPE_ENTITY_STATS;
+    private static boolean isPrewarmChunkPacket(int packetId) {
+        return packetId == SET_CHUNK_PACKET_ID
+                || packetId == SET_CHUNK_HEIGHTMAP_PACKET_ID
+                || packetId == SET_CHUNK_TINTMAP_PACKET_ID
+                || packetId == SET_CHUNK_ENVIRONMENTS_PACKET_ID;
     }
 
     private static ByteBuf entityUpdatesPacket(byte[] uncompressedPayload) {
@@ -1534,7 +1506,8 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
     private boolean handleShardTaleHandoffMessage(HyProxy proxy, byte[] data) {
         ByteBuf buf = Unpooled.wrappedBuffer(data);
         try {
-            if (buf.readableBytes() != SHARDTALE_HANDOFF_PAYLOAD_BYTES) {
+            boolean prewarm = buf.readableBytes() == SHARDTALE_PREWARM_PAYLOAD_BYTES;
+            if (buf.readableBytes() != SHARDTALE_HANDOFF_PAYLOAD_BYTES && !prewarm) {
                 return false;
             }
 
@@ -1557,6 +1530,9 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
             float yaw = buf.readFloatLE();
             float pitch = buf.readFloatLE();
             float roll = buf.readFloatLE();
+            if (prewarm && buf.readUnsignedByte() != SHARDTALE_PREWARM_MODE) {
+                return false;
+            }
 
             HyProxyBackend targetBackend = proxy.getBackendById(backendId);
             if (targetBackend == null) {
@@ -1564,20 +1540,79 @@ public class OutboundForwardingPacketHandler implements HytalePacketHandler {
             }
 
             HyProxyPlayer target = connection.ensurePlayer();
-            target.sendPlayerToBackend(targetBackend, new HyProxyPlayer.SeamlessTransferCorrection(
+            HyProxyPlayer.SeamlessTransferCorrection correction = new HyProxyPlayer.SeamlessTransferCorrection(
                     x,
                     y,
                     z,
                     yaw,
                     pitch,
                     roll
-            ));
+            );
+            if (prewarm) {
+                if (!SEAMLESS_PREWARM_ENABLED) {
+                    log.debug("{} ignored disabled ShardTale seamless prewarm request for {}",
+                            target.getIdentifier(),
+                            targetBackend.getInfo().id());
+                    return true;
+                }
+
+                target.requestSeamlessPrewarm(targetBackend, correction);
+                return true;
+            }
+
+            if (this.promoteReadyPrewarmedSeamlessHandoff(target, targetBackend, correction)) {
+                return true;
+            }
+
+            target.sendPlayerToBackend(targetBackend, correction);
             return true;
         } catch (RuntimeException ignored) {
             return false;
         } finally {
             buf.release();
         }
+    }
+
+    private boolean promoteReadyPrewarmedSeamlessHandoff(
+            HyProxyPlayer player,
+            HyProxyBackend targetBackend,
+            HyProxyPlayer.SeamlessTransferCorrection correction
+    ) {
+        if (!player.isSeamlessPrewarming()
+                || !player.isSeamlessPrewarmReady()
+                || player.getPendingSeamlessBackend() != targetBackend
+                || player.getPendingOutboundConnection() == null) {
+            return false;
+        }
+
+        HytaleConnection pendingConnection = player.getPendingOutboundConnection();
+        Set<Integer> staleEntityIds = player.trackedBackendEntityIdsForRemoval();
+        player.refreshPendingSeamlessCorrection(targetBackend, correction);
+        player.convertSeamlessPrewarmToHandoff(targetBackend, correction);
+        player.promotePendingOutboundConnection(pendingConnection, targetBackend);
+        player.consumeSuppressNextJoinWorld();
+        this.sendStaleEntityRemoval(player, staleEntityIds);
+        player.clearTrackedBackendEntityIds();
+
+        HyProxyPlayer.PendingSetClientId pendingSetClientId = player.consumePendingSeamlessSetClientId();
+        if (pendingSetClientId != null) {
+            if (player.hasActiveInboundConnection()) {
+                if (pendingSetClientId.clientEntityId() != Integer.MIN_VALUE) {
+                    player.setCurrentClientEntityId(pendingSetClientId.clientEntityId());
+                }
+                player.getInboundConnection().write(NetworkChannel.DEFAULT, pendingSetClientId.packet());
+                this.sendSeamlessPositionCorrection(player);
+                player.getOutboundConnection().write(NetworkChannel.DEFAULT, clientReadyPacket(false, true));
+            } else {
+                pendingSetClientId.packet().release();
+            }
+        } else {
+            player.queuePendingSeamlessGameplayReady();
+            this.sendSeamlessPositionCorrection(player);
+        }
+
+        log.info("{} promoted prewarmed seamless backend handoff to {}", player.getIdentifier(), targetBackend.getInfo().id());
+        return true;
     }
 
     private void sendSyntheticPongs(int id) {
